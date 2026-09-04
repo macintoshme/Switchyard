@@ -1,0 +1,66 @@
+# Fork-local image pipeline: build the switchyard-server image from the root
+# Dockerfile and push it to ghcr.io. Purely additive — not present upstream —
+# so upstream pulls merge clean.
+name: Build and publish container image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: "Upstream release tag to build (e.g. v0.2.0). Empty builds main."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: nemo-switchyard
+
+jobs:
+  image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tag dispatches check out the release tag; everything else uses
+          # the event ref.
+          ref: ${{ inputs.build_tag || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve image tags
+        id: tags
+        env:
+          BUILD_TAG: ${{ inputs.build_tag }}
+        run: |
+          set -euo pipefail
+          repo="${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
+          {
+            echo "tags<<EOF"
+            if [ -n "${BUILD_TAG}" ]; then
+              echo "${repo}:${BUILD_TAG}"
+            else
+              echo "${repo}:main"
+              echo "${repo}:sha-${GITHUB_SHA}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

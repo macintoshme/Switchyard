@@ -1,0 +1,74 @@
+# Fork-local automation: keep main and the latest upstream release tag in
+# sync with NVIDIA-NeMo/Switchyard, then dispatch image builds. Purely
+# additive — not present upstream — so upstream pulls merge clean.
+#
+# Pushes use GITHUB_TOKEN, which does not fire on:push workflows, so image
+# builds are dispatched explicitly via `gh workflow run` (workflow_dispatch
+# is exempt from that restriction).
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # daily 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # push main and release tags
+  actions: write # dispatch image builds
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main and release tag from upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Merge upstream main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NVIDIA-NeMo/Switchyard.git
+          git fetch upstream --tags --prune
+          before="$(git rev-parse HEAD)"
+          # Fast-forwards when possible, otherwise creates a merge commit.
+          # Merge conflicts fail loudly for manual resolution.
+          git merge --signoff -m "chore: sync upstream main" upstream/main
+          if [ "$(git rev-parse HEAD)" != "$before" ]; then
+            git push origin main
+            echo "MAIN_UPDATED=true" >> "$GITHUB_ENV"
+          fi
+      - name: Mirror latest upstream release tag
+        run: |
+          set -euo pipefail
+          # Newest non-prerelease upstream tag; rc/beta tags are skipped.
+          latest="$(git tag --list 'v*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+          if [ -z "$latest" ]; then
+            echo "No upstream release tag found; skipping."
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${latest}" >/dev/null 2>&1; then
+            echo "Release tag ${latest} already on origin; skipping."
+          else
+            git push origin "refs/tags/${latest}"
+            echo "BUILD_TAG=${latest}" >> "$GITHUB_ENV"
+          fi
+      - name: Dispatch image builds
+        if: ${{ env.MAIN_UPDATED == 'true' || env.BUILD_TAG != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${MAIN_UPDATED:-}" = "true" ]; then
+            gh workflow run image.yml --ref main
+          fi
+          if [ -n "${BUILD_TAG:-}" ]; then
+            gh workflow run image.yml --ref main -f build_tag="${BUILD_TAG}"
+          fi
