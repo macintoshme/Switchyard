@@ -69,7 +69,12 @@ jobs:
             echo "Release tag ${latest} already on origin; skipping."
           else
             git push origin "refs/tags/${latest}"
-            echo "BUILD_TAG=${latest}" >> "$GITHUB_ENV"
+            # Release tags that predate the root Dockerfile cannot be built.
+            if git cat-file -e "${latest}:Dockerfile" 2>/dev/null; then
+              echo "BUILD_TAG=${latest}" >> "$GITHUB_ENV"
+            else
+              echo "Tag ${latest} predates the root Dockerfile; no image build."
+            fi
           fi
       - name: Dispatch image builds
         if: ${{ env.MAIN_UPDATED == 'true' || env.BUILD_TAG != '' }}
