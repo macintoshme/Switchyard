@@ -75,6 +75,9 @@ jobs:
         if: ${{ env.MAIN_UPDATED == 'true' || env.BUILD_TAG != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh infers the repo from git remotes and prefers "upstream";
+          # pin dispatches to the fork.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "${MAIN_UPDATED:-}" = "true" ]; then
