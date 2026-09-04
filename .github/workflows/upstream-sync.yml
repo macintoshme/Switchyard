@@ -2,9 +2,10 @@
 # sync with NVIDIA-NeMo/Switchyard, then dispatch image builds. Purely
 # additive — not present upstream — so upstream pulls merge clean.
 #
-# Pushes use GITHUB_TOKEN, which does not fire on:push workflows, so image
-# builds are dispatched explicitly via `gh workflow run` (workflow_dispatch
-# is exempt from that restriction).
+# Pushes use a repo deploy key (SYNC_DEPLOY_KEY secret): GITHUB_TOKEN
+# cannot push refs that carry upstream workflow files. Image builds are
+# dispatched explicitly via `gh workflow run` with GITHUB_TOKEN
+# (workflow_dispatch is exempt from its no-retrigger restriction).
 name: Sync upstream
 
 on:
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # push main and release tags
+  contents: read # checkout; pushes authenticate with the deploy key
   actions: write # dispatch image builds
 
 concurrency:
@@ -25,10 +26,20 @@ jobs:
     name: Sync main and release tag from upstream
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: main
+      - name: Configure SSH push key
+        env:
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SYNC_DEPLOY_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
       - name: Merge upstream main
         run: |
           set -euo pipefail
