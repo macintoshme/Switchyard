@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
+    collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
     is_known_role_name, provider_extensions, reasoning_text_from_blocks, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
@@ -653,37 +654,18 @@ fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBloc
     if let Some(text) = item.get("text").and_then(Value::as_str) {
         parts.push(text.to_string());
     }
+    // Encrypted reasoning must be replayed under the provider-issued item id;
+    // retain the original item only when it carries that opaque payload.
+    let details = if item.get("encrypted_content").is_some() {
+        vec![Value::Object(item.clone())]
+    } else {
+        Vec::new()
+    };
     vec![ContentBlock::Reasoning {
         text: parts.join("\n"),
         signature: None,
-        details: Vec::new(),
+        details,
     }]
-}
-
-// Collects text from the known Responses reasoning content/summary shapes.
-fn collect_responses_reasoning_text(value: Option<&Value>, out: &mut Vec<String>) {
-    match value {
-        Some(Value::String(text)) if !text.is_empty() => out.push(text.clone()),
-        Some(Value::Array(items)) => {
-            for item in items {
-                match item {
-                    Value::String(text) if !text.is_empty() => out.push(text.clone()),
-                    Value::Object(object) => {
-                        if matches!(
-                            object.get("type").and_then(Value::as_str),
-                            Some("reasoning_text" | "summary_text" | "text")
-                        ) && let Some(text) = object.get("text").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            out.push(text.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 // Decodes Responses content arrays or strings into normalized content blocks.
@@ -1060,15 +1042,18 @@ fn encode_responses_input(
         }
         let mut visible_content = Vec::new();
         let mut emitted_special = false;
+        let mut omitted_reasoning = false;
         for block in &content {
             if let Some(item) = encode_responses_special_input(block, namespaces) {
                 encoded.push(item);
                 emitted_special = true;
-            } else {
+            } else if !matches!(block, ContentBlock::Reasoning { .. }) {
                 visible_content.push(block.clone());
+            } else {
+                omitted_reasoning = true;
             }
         }
-        if !visible_content.is_empty() || !emitted_special {
+        if !visible_content.is_empty() || (!emitted_special && !omitted_reasoning) {
             let content = encode_responses_content(&visible_content, diagnostics, policy)?;
             encoded.push(json!({
                 "type": "message",
@@ -1089,12 +1074,8 @@ fn encode_responses_special_input(
         ContentBlock::Reasoning {
             text,
             signature: None,
-            ..
-        } => Some(json!({
-            "type": "reasoning",
-            "content": [{"type": "reasoning_text", "text": text}],
-            "summary": [],
-        })),
+            details,
+        } => encode_responses_reasoning_input(text, details),
         ContentBlock::ToolCall(call) => {
             // A Responses client dispatches on name plus namespace, so undo the
             // qualification this request applied for a flat upstream.
@@ -1123,6 +1104,37 @@ fn encode_responses_special_input(
         })),
         _ => None,
     }
+}
+
+// Encodes reasoning in the shape accepted for Responses input history. Response
+// output items may carry `content`, but replayed input items must avoid it.
+fn encode_responses_reasoning_input(text: &str, details: &[Value]) -> Option<Value> {
+    for detail in details {
+        let Some(detail) = detail.as_object() else {
+            continue;
+        };
+        if detail.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let mut item = Map::new();
+        item.insert("type".to_string(), Value::String("reasoning".to_string()));
+        for field in ["id", "summary", "encrypted_content"] {
+            if let Some(value) = detail.get(field) {
+                item.insert(field.to_string(), value.clone());
+            }
+        }
+        item.entry("summary".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        return Some(Value::Object(item));
+    }
+
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": text}],
+    }))
 }
 
 // Maps normalized roles back to Responses role strings.
@@ -1342,8 +1354,20 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                 };
                 let mut items = Vec::new();
 
-                if !reasoning.is_empty() {
-                    items.push(encode_responses_reasoning_output(&reasoning));
+                let encrypted_reasoning = output.content.iter().find_map(|block| match block {
+                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_data(details),
+                    _ => None,
+                });
+                let encrypted_reasoning_id = output.content.iter().find_map(|block| match block {
+                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_item_id(details),
+                    _ => None,
+                });
+                if !reasoning.is_empty() || encrypted_reasoning.is_some() {
+                    items.push(encode_responses_reasoning_output(
+                        &reasoning,
+                        encrypted_reasoning.as_deref(),
+                        encrypted_reasoning_id.as_deref(),
+                    ));
                 }
 
                 if !text.is_empty() || (!has_tool_calls && reasoning.is_empty()) {
@@ -1376,18 +1400,29 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
     )
 }
 
-// Encodes private reasoning as a separate Responses output item.
-fn encode_responses_reasoning_output(text: &str) -> Value {
-    json!({
+// Encodes private reasoning as a separate Responses output item. An encrypted-only item
+// carries no text part but keeps `encrypted_content` so the client can replay it.
+fn encode_responses_reasoning_output(
+    text: &str,
+    encrypted: Option<&str>,
+    item_id: Option<&str>,
+) -> Value {
+    // Standard Responses shape: text as `summary_text` parts, which is what clients record.
+    let mut summary = Vec::new();
+    if !text.is_empty() {
+        summary.push(json!({"type": "summary_text", "text": text}));
+    }
+    // Encrypted reasoning verifies only under the id it was issued with, so reuse it.
+    let mut item = json!({
         "type": "reasoning",
-        "id": "rs_switchyard",
+        "id": item_id.unwrap_or("rs_switchyard"),
         "status": "completed",
-        "content": [{
-            "type": "reasoning_text",
-            "text": text,
-        }],
-        "summary": [],
-    })
+        "summary": summary,
+    });
+    if let Some(encrypted) = encrypted {
+        item["encrypted_content"] = Value::String(encrypted.to_string());
+    }
+    item
 }
 
 // Serializes JSON with Python-like spacing to match legacy converter behavior.
