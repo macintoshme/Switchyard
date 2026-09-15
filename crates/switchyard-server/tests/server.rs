@@ -173,6 +173,69 @@ async fn upstream_chat(
         )
             .into_response();
     }
+    if prompt == "upstream-headers" {
+        // Both the buffered and the streamed reply echo the same set, so the two
+        // capture paths are compared against one expectation.
+        const UPSTREAM_HEADER_ECHO: [(&str, &str); 5] = [
+            ("x-upstream-trace", "trace-123"),
+            ("x-request-id", "req-42"),
+            ("request-id", "req_anthropic_42"),
+            ("x-model-router-selected-model", "model/upstream-echo"),
+            ("x-switchyard-session-id", "spoofed-by-upstream"),
+        ];
+        // Streaming captures the headers off the response head, before any body
+        // arrives, so the streamed variant exercises a different capture branch.
+        let mut response = if body["stream"].as_bool() == Some(true) {
+            let events = [
+                json!({"id": "chatcmpl-headers", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}}]}).to_string(),
+                json!({"id": "chatcmpl-headers", "model": model, "choices": [{"index": 0, "delta": {"content": "ok"}}]}).to_string(),
+                json!({"id": "chatcmpl-headers", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}}).to_string(),
+                "[DONE]".to_string(),
+            ];
+            let stream = futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
+            );
+            let mut response = Sse::new(stream).into_response();
+            let headers = response.headers_mut();
+            for (name, value) in UPSTREAM_HEADER_ECHO {
+                headers.append(name, HeaderValue::from_static(value));
+            }
+            response
+        } else {
+            (
+                UPSTREAM_HEADER_ECHO,
+                Json(json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+                })),
+            )
+                .into_response()
+        };
+        let headers = response.headers_mut();
+        headers.append("x-upstream-trace", HeaderValue::from_static("trace-456"));
+        headers.append(
+            "link",
+            HeaderValue::from_static("<https://example.test/next>; rel=next"),
+        );
+        headers.append(
+            "link",
+            HeaderValue::from_static("<https://example.test/prev>; rel=prev"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("session=upstream; HttpOnly"),
+        );
+        return response;
+    }
     if body["stream"].as_bool() == Some(true) {
         // Streamed tool call, for the namespace-on-every-event assertions. The
         // model calls a tool by the name it was given, so echo that name back.
@@ -368,8 +431,14 @@ async fn upstream_messages_requires_forwarded_oauth(
             .get("anthropic-version")
             .and_then(|value| value.to_str().ok())
             == Some("2023-06-01")
-        && !headers.contains_key("chatgpt-account-id")
-        && !headers.contains_key("x-openai-fedramp");
+        && headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            == Some("account-123")
+        && headers
+            .get("x-openai-fedramp")
+            .and_then(|value| value.to_str().ok())
+            == Some("true");
     if !has_expected_headers {
         return (
             StatusCode::UNAUTHORIZED,
@@ -422,8 +491,14 @@ async fn upstream_responses_requires_forwarded_auth(
             .get("x-openai-fedramp")
             .and_then(|value| value.to_str().ok())
             == Some("true")
-        && !headers.contains_key("x-api-key")
-        && !headers.contains_key("anthropic-beta");
+        && headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            == Some("provider-api-key")
+        && headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            == Some("provider-beta");
     if !has_expected_headers {
         return (
             StatusCode::UNAUTHORIZED,
@@ -2316,8 +2391,8 @@ target = "claude"
         &[
             ("authorization", "Bearer claude-oauth-token"),
             ("anthropic-beta", "oauth-2025-04-20,unsupported-beta"),
-            ("chatgpt-account-id", "must-not-cross-providers"),
-            ("x-openai-fedramp", "must-not-cross-providers"),
+            ("chatgpt-account-id", "account-123"),
+            ("x-openai-fedramp", "true"),
         ],
     )
     .await?;
@@ -2372,8 +2447,8 @@ target = "openai"
             ("authorization", "Bearer codex-login-token"),
             ("chatgpt-account-id", "account-123"),
             ("x-openai-fedramp", "true"),
-            ("x-api-key", "must-not-cross-providers"),
-            ("anthropic-beta", "oauth-must-not-cross-providers"),
+            ("x-api-key", "provider-api-key"),
+            ("anthropic-beta", "provider-beta"),
         ],
     )
     .await?;
@@ -2671,6 +2746,232 @@ target = "shared"
         codex_metadata["undeclared"]["supports_parallel_tool_calls"],
         json!(true)
     );
+    Ok(())
+}
+
+// Tool results and blank user messages must not replace the classifier's task text.
+#[tokio::test]
+async fn subagent_tool_continuations_are_classified_on_every_request_across_apis() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+[targets]
+classifier = {{ id = "model/classifier", llm_client = "upstream" }}
+strong = {{ id = "model/strong", llm_client = "upstream" }}
+weak = {{ id = "model/weak", llm_client = "upstream" }}
+[routes.agent]
+id = "agent"
+type = "passthrough"
+target = "weak"
+[routes.agent.subagents]
+type = "llm_classifier"
+mode = "custom"
+classify_trigger = "every_request"
+models = {{ judge = ["classifier"], capable = ["strong"], efficient = ["weak"], any = ["strong", "weak"] }}
+default_target = "efficient"
+prompt = "classify the delegated task"
+response_schema = '''{{"type":"object","properties":{{"decision":{{"type":"object","properties":{{"target":{{"type":"string","enum":["capable","efficient"]}}}},"required":["target"],"additionalProperties":false}}}},"required":["decision"],"additionalProperties":false}}'''
+[routes.agent.subagents.policy]
+type = "target_selector"
+selector = "/decision/target"
+"#,
+        base_url = upstream.base_url
+    ))?);
+    let headers = [
+        ("x-claude-code-session-id", "root-session"),
+        ("x-claude-code-agent-id", "child-agent"),
+    ];
+    for (path, key, mut body, tool_turn) in [
+        (
+            "/v1/chat/completions",
+            "messages",
+            json!({"model":"agent","messages":[
+                {"role":"system","content":"child system instructions"},
+                {"role":"user","content":"harness context"},
+                {"role":"user","content":[{"type":"text","text":"injected context"},{"type":"text","text":"opening task: route to capable"}]}
+            ]}),
+            vec![
+                json!({"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":"call_1","content":"tool output"}),
+            ],
+        ),
+        (
+            "/v1/messages",
+            "messages",
+            json!({"model":"agent","max_tokens":16,"system":"child system instructions","messages":[
+                {"role":"user","content":"harness context"},
+                {"role":"user","content":[{"type":"text","text":"injected context"},{"type":"text","text":"opening task: route to capable"}]}
+            ]}),
+            vec![
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"tool output"}]}),
+            ],
+        ),
+        (
+            "/v1/responses",
+            "input",
+            json!({"model":"agent","instructions":"child system instructions","input":[
+                {"role":"user","content":"harness context"},
+                {"role":"user","content":[{"type":"input_text","text":"injected context"},{"type":"input_text","text":"opening task: route to capable"}]}
+            ]}),
+            vec![
+                json!({"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{}"}),
+                json!({"type":"function_call_output","call_id":"call_1","output":"tool output"}),
+            ],
+        ),
+    ] {
+        for (step, (additions, expected_prompt)) in [
+            (vec![], "opening task: route to capable"),
+            (tool_turn.clone(), "opening task: route to capable"),
+            (
+                vec![json!({"role":"user","content":" \n\t"})],
+                "opening task: route to capable",
+            ),
+            (
+                vec![json!({"role":"user","content":"continue task: route to capable"})],
+                "continue task: route to capable",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            body[key]
+                .as_array_mut()
+                .ok_or("missing request messages")?
+                .extend(additions);
+            let response =
+                send_with_headers(&app, "POST", path, Some(body.clone()), &headers).await?;
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(
+                response.headers["x-model-router-selected-model"],
+                "model/strong"
+            );
+            let calls = upstream.calls.lock().await;
+            let judge = &calls[calls.len() - 2];
+            assert_eq!(judge["model"], "model/classifier");
+            assert_eq!(
+                judge["messages"],
+                json!([
+                    {"role":"system","content":"classify the delegated task"},
+                    {"role":"user","content":expected_prompt}
+                ])
+            );
+            let answer = calls.last().ok_or("missing answer request")?.to_string();
+            for preserved in [
+                "child system instructions",
+                "harness context",
+                "injected context",
+                "opening task: route to capable",
+                expected_prompt,
+            ] {
+                assert!(answer.contains(preserved));
+            }
+            if step > 0 {
+                assert!(answer.contains("tool output"));
+                assert!(answer.contains("call_1"));
+            }
+        }
+        let mut text_free = body;
+        text_free[key] = json!(tool_turn);
+        let response = send_with_headers(&app, "POST", path, Some(text_free), &headers).await?;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.headers["x-model-router-selected-model"],
+            "model/weak"
+        );
+    }
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["classifier"]["total_requests"], 12);
+    Ok(())
+}
+
+// Compaction uses the parent classifier; review tasks use the subagent worker.
+#[tokio::test]
+async fn codex_maintenance_uses_the_parent_classifier_across_apis() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+[targets]
+classifier = {{ id = "model/classifier", llm_client = "upstream" }}
+strong = {{ id = "model/strong", llm_client = "upstream" }}
+weak = {{ id = "model/weak", llm_client = "upstream" }}
+[routes.agent]
+id = "agent"
+type = "composite"
+classifier = {{ target = "classifier", base_threshold = 0.5, classify_trigger = "user_turn" }}
+stage = {{ capable_target = "strong", efficient_target = "weak", confidence_threshold = 0.3 }}
+subagents = {{ type = "passthrough", target = "strong" }}
+"#,
+        base_url = upstream.base_url
+    ))?);
+    let cases = [
+        (Some("compact"), None, "model/weak"),
+        (Some("review"), None, "model/strong"),
+        (Some("collab_spawn"), None, "model/strong"),
+        (Some("unknown"), None, "model/weak"),
+        (Some("memory_consolidation"), None, "model/weak"),
+        (None, None, "model/strong"),
+        (Some("review"), Some("false"), "model/weak"),
+        (Some("compact"), Some("true"), "model/weak"),
+    ];
+    for (path, body, cases) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"agent","messages":[{"role":"user","content":"hi"}]}),
+            &cases[..],
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"agent","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}),
+            &cases[..2],
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"agent","input":"hi"}),
+            &cases[..2],
+        ),
+    ] {
+        for (kind, explicit, expected) in cases {
+            let mut metadata = json!({
+                "thread_id": "child",
+                "parent_thread_id": "root",
+                "thread_source": "subagent",
+            });
+            if let Some(kind) = kind {
+                metadata["subagent_kind"] = json!(kind);
+            }
+            let metadata = metadata.to_string();
+            let mut headers = vec![("x-codex-turn-metadata", metadata.as_str())];
+            if let Some(explicit) = explicit {
+                headers.push(("x-switchyard-is-subagent", explicit));
+            }
+            let response =
+                send_with_headers(&app, "POST", path, Some(body.clone()), &headers).await?;
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.headers["x-model-router-selected-model"], *expected);
+        }
+    }
+    let models = upstream.models().await;
+    for (model, expected) in [
+        ("model/classifier", 7),
+        ("model/weak", 7),
+        ("model/strong", 5),
+    ] {
+        assert_eq!(
+            models.iter().filter(|actual| *actual == model).count(),
+            expected
+        );
+    }
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["classifier"]["total_requests"], 7);
     Ok(())
 }
 
@@ -3907,6 +4208,108 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
         .ok_or("stream produced no response.completed event")?;
     assert_eq!(completed["response"]["output"][0]["name"], "search");
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
+    Ok(())
+}
+
+/// Allowed upstream response headers ride through to the client, while body, cookie,
+/// and Switchyard-owned headers do not; a header this server writes always beats an
+/// upstream echo of the same name.
+#[tokio::test]
+async fn upstream_headers_forward_but_switchyard_writes_win() -> TestResult {
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let body = json!({
+        "model": ROUTE_MODEL,
+        "messages": [{"role": "user", "content": "upstream-headers"}]
+    });
+    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    // Observability headers survive the proxy hop.
+    let traces = response
+        .headers
+        .get_all("x-upstream-trace")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ["trace-123", "trace-456"]);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-42")
+    );
+    // Anthropic spells its correlation id without the `x-` prefix.
+    assert_eq!(
+        response
+            .headers
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_anthropic_42")
+    );
+    assert!(!response.headers.contains_key("link"));
+
+    // Upstream cookies must never become Switchyard-origin cookies.
+    assert!(!response.headers.contains_key("set-cookie"));
+
+    // Switchyard's own namespace never forwards from upstream.
+    assert!(!response.headers.contains_key("x-switchyard-session-id"));
+
+    // …and Switchyard's routing write beats the upstream echo.
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/a")
+    );
+    Ok(())
+}
+
+/// A streamed reply captures its headers off the response head, on a branch the
+/// buffered path never touches, so the same contract is asserted there too.
+#[tokio::test]
+async fn upstream_headers_forward_on_streaming_responses() -> TestResult {
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let body = json!({
+        "model": ROUTE_MODEL,
+        "stream": true,
+        "messages": [{"role": "user", "content": "upstream-headers"}]
+    });
+    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let traces = response
+        .headers
+        .get_all("x-upstream-trace")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ["trace-123", "trace-456"]);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-42")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_anthropic_42")
+    );
+    assert!(!response.headers.contains_key("link"));
+    assert!(!response.headers.contains_key("set-cookie"));
+    assert!(!response.headers.contains_key("x-switchyard-session-id"));
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/a")
+    );
     Ok(())
 }
 
