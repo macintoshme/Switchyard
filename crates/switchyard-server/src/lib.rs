@@ -6,6 +6,7 @@
 pub mod config;
 mod metrics;
 mod observability;
+mod redaction;
 mod response;
 mod routing_log;
 mod shutdown;
@@ -157,6 +158,7 @@ struct DecisionLlmClientResponse {
 #[derive(Clone)]
 pub struct ServerState {
     runner: Arc<Runner>,
+    redactor: Arc<redaction::Redactor>,
     fallback_http: reqwest::Client,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
@@ -210,7 +212,9 @@ impl ServerState {
             metrics.clone(),
             runner.models().map(|model| model.algorithm),
         );
+        let redactor = redaction::Redactor::new(runner.provider_api_keys());
         Ok(Self {
+            redactor: Arc::new(redactor),
             runner: Arc::new(runner),
             fallback_http,
             metrics,
@@ -518,6 +522,10 @@ fn primary_llm_routes() -> Router<ServerState> {
 fn finish_router(router: Router<ServerState>, state: ServerState) -> Router {
     router
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            redaction::redact_response,
+        ))
         // `layer` only wraps routes registered before it, so this stays last.
         .layer(axum::middleware::from_fn(stamp_request_start))
         .with_state(state)
@@ -1060,11 +1068,16 @@ async fn handle_llm_request(
 
     let upstream_headers = std::mem::take(&mut response.upstream_headers);
     let response_model = served_model.as_ref().map(ToString::to_string);
-    let mut response =
-        match into_http_response(response, wire_format, response_model, request_extensions) {
-            Ok(response) => response,
-            Err(error) => return server_error(error.to_string()),
-        };
+    let mut response = match into_http_response(
+        response,
+        wire_format,
+        response_model,
+        request_extensions,
+        Arc::clone(&state.redactor),
+    ) {
+        Ok(response) => response,
+        Err(error) => return server_error(error.to_string()),
+    };
     // Forward upstream headers before Switchyard writes its own so any header
     // this server emits always overrides an upstream echo of the same name.
     let response_headers = response.headers_mut();
@@ -1251,12 +1264,7 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "context_length_exceeded",
         ),
-        LlmClientError::UpstreamHttp { status, body } => error_response(
-            *status,
-            upstream_error_message(body),
-            "upstream_error",
-            "upstream_error",
-        ),
+        LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1282,26 +1290,25 @@ fn client_error(error: &LlmClientError) -> Response {
     }
 }
 
-// Provider errors are often JSON documents; expose their message without
-// embedding the entire document as an escaped string in our error envelope.
-fn upstream_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|body| {
-            body.pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.to_string())
+// Keep the provider's message and nonempty string code in our error JSON.
+fn upstream_error(status: StatusCode, body: &str) -> Response {
+    let parsed = serde_json::from_str::<Value>(body).unwrap_or_default();
+    let error = &parsed["error"];
+    let message = error["message"].as_str().unwrap_or(body);
+    let code = error["code"]
+        .as_str()
+        .filter(|code| !code.is_empty())
+        .unwrap_or("upstream_error");
+    error_response(status, message, "upstream_error", code)
 }
 
-// Error metadata retained until the client-facing endpoint selects an envelope.
+// Keep error details until the endpoint chooses its response format.
 #[derive(Clone)]
 struct ApiError {
     status: StatusCode,
     message: String,
     error_type: &'static str,
-    code: &'static str,
+    code: String,
 }
 
 impl ApiError {
@@ -1309,13 +1316,13 @@ impl ApiError {
         status: StatusCode,
         message: impl Into<String>,
         error_type: &'static str,
-        code: &'static str,
+        code: impl Into<String>,
     ) -> Self {
         Self {
             status,
             message: message.into(),
             error_type,
-            code,
+            code: code.into(),
         }
     }
 
@@ -1386,7 +1393,7 @@ fn error_response(
     status: StatusCode,
     message: impl Into<String>,
     error_type: &'static str,
-    code: &'static str,
+    code: impl Into<String>,
 ) -> Response {
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
 }
@@ -1488,11 +1495,8 @@ fn model_list_payload<'a>(
     json!({
         "object": "list",
         "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
-        "models": entries
-            .iter()
-            .enumerate()
-            .map(|(priority, (model, caps))| codex_model_entry_json(model, *caps, priority))
-            .collect::<Vec<_>>(),
+        // Codex requires this key; an empty list preserves its own catalog and instructions.
+        "models": [],
         "first_id": first_id,
         "last_id": last_id,
         "has_more": false,
@@ -1521,83 +1525,6 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
             ],
         },
     })
-}
-
-// Builds the metadata Codex requires when it discovers models from a direct provider.
-//
-// This mirrors Codex's `ModelInfo` card. The benchmark harness builds the same card in
-// `benchmark/codex_model_catalog_lib.py`; keep the two in sync when Codex changes
-// the shape. Every field below is either derived from the route's declared capabilities or a
-// required `ModelInfo` field the server has no better value for.
-//
-// Two kinds of fields live here. context_window, tool_calling, and reasoning are model
-// facts a backend can publish; the route declares them in config today. The rest
-// (shell_type, apply_patch_tool_type, base_instructions, the reasoning-level presets,
-// truncation_policy) are Codex client conventions no backend returns, so they stay
-// constant.
-//
-// TODO: source context_window, tool_calling, and reasoning from the backend, not route
-// config. Switchyard is a proxy, so it should re-publish what the backend advertises
-// when it can — OpenRouter's /api/v1/models exposes context_length and
-// supported_parameters — and fall back to the route's declared value. Some backends
-// publish nothing (the NVIDIA gateway returns id-only models and blocks /model/info),
-// so keep failing closed to config.
-fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority: usize) -> Value {
-    // Codex is non-functional without shell and apply_patch, so an undeclared tool
-    // capability defaults to enabled here; the OpenAI `data` entry reports the raw
-    // Option separately for clients that want the undeclared state.
-    let tool_calling = capabilities.tool_calling.unwrap_or(true);
-    let reasoning = capabilities.reasoning.unwrap_or(false);
-    json!({
-        "slug": model,
-        "display_name": model,
-        "description": "Switchyard-routed model.",
-        "default_reasoning_level": if reasoning { json!("xhigh") } else { Value::Null },
-        "supported_reasoning_levels": if reasoning { reasoning_levels() } else { json!([]) },
-        "shell_type": if tool_calling { "shell_command" } else { "disabled" },
-        "visibility": "list",
-        "supported_in_api": true,
-        // Catalog list position (routes are listed in sorted id order), not a quality rank.
-        "priority": priority,
-        "additional_speed_tiers": [],
-        "availability_nux": null,
-        "upgrade": null,
-        // Required `ModelInfo` string. Unlike the launcher, the server cannot read
-        // Codex's bundled prompt, so it sends a minimal stub.
-        "base_instructions": "You are Codex, a coding agent.",
-        "supports_reasoning_summaries": reasoning,
-        "default_reasoning_summary": "none",
-        "support_verbosity": reasoning,
-        "default_verbosity": if reasoning { json!("low") } else { Value::Null },
-        "apply_patch_tool_type": if tool_calling { Some("freeform") } else { None },
-        "web_search_tool_type": "text",
-        "truncation_policy": {"mode": "tokens", "limit": 10_000},
-        "supports_parallel_tool_calls": tool_calling,
-        "supports_image_detail_original": false,
-        "context_window": capabilities.context_window,
-        "max_context_window": capabilities.context_window,
-        "effective_context_window_percent": 95,
-        "experimental_supported_tools": [],
-        // Codex omits an attached image client-side when this says text-only, so a
-        // route whose target can see must declare `vision = true`. Fails closed.
-        "input_modalities": if capabilities.vision.unwrap_or(false) {
-            json!(["text", "image"])
-        } else {
-            json!(["text"])
-        },
-        "supports_search_tool": false,
-    })
-}
-
-// The reasoning-effort presets Codex offers for a reasoning-capable route. Kept in
-// step with the benchmark template in `codex_model_catalog_lib.py`.
-fn reasoning_levels() -> Value {
-    json!([
-        {"effort": "low", "description": "Fast responses with lighter reasoning"},
-        {"effort": "medium", "description": "Balances speed and reasoning depth"},
-        {"effort": "high", "description": "Greater reasoning depth"},
-        {"effort": "xhigh", "description": "Extra high reasoning depth"},
-    ])
 }
 
 fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) -> String {

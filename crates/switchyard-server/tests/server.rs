@@ -51,6 +51,7 @@ impl MockUpstream {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/v1/chat/completions", post(upstream_chat))
+            .route("/buffered/responses", post(upstream_buffered_responses))
             .route(
                 "/v1/messages",
                 post(upstream_messages_requires_forwarded_oauth),
@@ -521,6 +522,43 @@ async fn upstream_responses_requires_forwarded_auth(
     .into_response()
 }
 
+async fn upstream_buffered_responses(
+    State(calls): State<Arc<Mutex<Vec<Value>>>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    calls.lock().await.push(body.clone());
+    let model = body["model"].as_str().unwrap_or_default();
+    let mut response = json!({
+        "id": "resp_buffered", "object": "response", "model": model,
+        "status": "failed", "output": [], "usage": null,
+        "error": {"code": "server_error", "message": "deterministic upstream failure"}
+    });
+    match model {
+        "model/missing-error" => response = json!({"status": "failed"}),
+        "model/invalid-error" => response["error"] = json!("invalid error details"),
+        "model/invalid-code" => response["error"]["code"] = json!(42),
+        "model/empty-code" => response["error"]["code"] = json!(""),
+        "model/fallback" => {
+            response["status"] = json!("completed");
+            response["error"] = Value::Null;
+            response["output"] = json!([{
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }]);
+        }
+        _ => {}
+    }
+    if let Some(secret) = headers.get("x-private-token") {
+        response["error"]["code"] = json!(secret.to_str().unwrap_or_default());
+        response["error"]["message"] = json!(format!(
+            "provider rejected {}",
+            secret.to_str().unwrap_or_default()
+        ));
+    }
+    Json(response)
+}
+
 async fn upstream_redirect_capture(
     State(calls): State<Arc<Mutex<Vec<Value>>>>,
     headers: HeaderMap,
@@ -803,6 +841,120 @@ async fn stats_accumulates_buffered_success_error_and_shared_routes() -> TestRes
     Ok(())
 }
 
+fn buffered_responses_app(
+    upstream: &MockUpstream,
+    model: &str,
+    fallback: bool,
+    forward_auth: bool,
+) -> TestResult<Router> {
+    let route = if fallback {
+        "type = \"random\"\ntargets = [\"first\", \"second\"]\nweights = [1000, 1]\nseed = 17"
+    } else {
+        "type = \"passthrough\"\ntarget = \"first\""
+    };
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_responses"
+base_url = "{base_url}/buffered"
+forward_auth = {forward_auth}
+max_retries = 0
+[targets]
+first = {{ id = "{model}", llm_client = "mock" }}
+second = {{ id = "model/fallback", llm_client = "mock" }}
+[routes.response]
+id = "{ROUTE_MODEL}"
+{route}
+"#,
+        base_url = upstream.base_url.trim_end_matches("/v1"),
+    ))?;
+    Ok(build_switchyard_router(state))
+}
+
+#[tokio::test]
+async fn failed_responses_return_errors_and_try_fallback_across_endpoints() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let requests = [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": ROUTE_MODEL, "messages": [{"role": "user", "content": "hello"}]
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": ROUTE_MODEL, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": ROUTE_MODEL, "input": "hello"}),
+        ),
+    ];
+    let failure = "deterministic upstream failure";
+    let missing = "provider reported status \"failed\" without error details";
+    for (model, message, code) in [
+        ("model/failed", failure, "server_error"),
+        ("model/missing-error", missing, "upstream_error"),
+        ("model/invalid-error", missing, "upstream_error"),
+        ("model/invalid-code", failure, "upstream_error"),
+        ("model/empty-code", failure, "upstream_error"),
+    ] {
+        let app = buffered_responses_app(&upstream, model, false, false)?;
+        for (path, body) in &requests {
+            let response = send(&app, "POST", path, Some(body.clone())).await?;
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY, "{model}: {path}");
+            let expected = if *path == "/v1/messages" {
+                json!({"type": "error", "error": {"type": "api_error", "message": message}})
+            } else {
+                json!({"error": {"type": "upstream_error", "code": code, "message": message}})
+            };
+            assert_eq!(response.json()?, expected, "{model}: {path}");
+        }
+        let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+        assert_eq!(stats["total_requests"], requests.len(), "{model}");
+        assert_eq!(stats["total_errors"], requests.len(), "{model}");
+        assert_eq!(stats["models"][model]["errors"], requests.len(), "{model}");
+    }
+
+    let app = buffered_responses_app(&upstream, "model/failed", false, true)?;
+    let (path, body) = &requests[0];
+    let response = send_with_headers(
+        &app,
+        "POST",
+        path,
+        Some(body.clone()),
+        &[("x-private-token", "test-private-credential")],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.json()?["error"]["message"],
+        "provider rejected [REDACTED]"
+    );
+    assert_eq!(response.json()?["error"]["code"], "[REDACTED]");
+
+    let app = buffered_responses_app(&upstream, "model/failed", true, false)?;
+    for (path, body) in &requests {
+        let previous_calls = upstream.models().await.len();
+        let response = send(&app, "POST", path, Some(body.clone())).await?;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.json()?["model"], "model/fallback", "{path}");
+        assert_eq!(
+            &upstream.models().await[previous_calls..],
+            ["model/failed", "model/fallback"],
+            "{path}"
+        );
+    }
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["models"]["model/failed"]["errors"], requests.len());
+    assert_eq!(stats["models"]["model/fallback"]["calls"], requests.len());
+    Ok(())
+}
+
 #[tokio::test]
 async fn stats_reset_returns_confirmation_and_clears_all_stats() -> TestResult {
     let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
@@ -1012,8 +1164,7 @@ fn load_test_config(toml: &str) -> TestResult<ServerState> {
     Ok(load_server_state(config.path())?)
 }
 
-/// A `random` route that selects `first` before any request-local fallback.
-fn fallback_state(base_url: &str) -> TestResult<ServerState> {
+fn weighted_random_state(base_url: &str, weights: [u32; 2]) -> TestResult<ServerState> {
     load_test_config(&format!(
         r#"
 schema_version = 1
@@ -1037,7 +1188,8 @@ system_prompt = "strong answer prompt"
 id = "{ROUTE_MODEL}"
 type = "random"
 targets = ["first", "second"]
-weights = [1, 0]
+weights = {weights:?}
+seed = 17
 "#,
         first = "model/weak",
         second = "model/strong",
@@ -2628,6 +2780,7 @@ type = "passthrough"
 target = "shared"
 context_window = 1000000
 tool_calling = true
+vision = true
 
 [routes.restricted]
 id = "restricted"
@@ -2635,12 +2788,7 @@ type = "passthrough"
 target = "shared"
 context_window = 262000
 tool_calling = false
-
-[routes.reasoning]
-id = "reasoning"
-type = "passthrough"
-target = "shared"
-reasoning = true
+vision = false
 
 [routes.undeclared]
 id = "undeclared"
@@ -2648,7 +2796,7 @@ type = "passthrough"
 target = "shared"
 "#;
     let app = build_switchyard_router(load_test_config(CONFIG)?);
-    let models = send(&app, "GET", "/v1/models", None).await?;
+    let models = send(&app, "GET", "/v1/models?client_version=0.152.0", None).await?;
     assert_eq!(models.status, StatusCode::OK);
     let body = models.json()?;
     let data = body["data"].as_array().cloned().unwrap_or_default();
@@ -2664,88 +2812,11 @@ target = "shared"
     assert_eq!(capabilities["undeclared"]["context_window"], json!(null));
     assert_eq!(capabilities["undeclared"]["tool_calling"], json!(null));
 
-    let codex_models = body["models"].as_array().cloned().unwrap_or_default();
-    let codex_metadata = codex_models
-        .iter()
-        .filter_map(|entry| entry["slug"].as_str().map(|slug| (slug, entry)))
-        .collect::<BTreeMap<_, _>>();
-    // This checks the shape the server emits. That Codex 0.144.5 actually decodes it
-    // (context_window: null included) is verified by a live Codex run in SWITCH-1225.
-    assert_eq!(codex_metadata.len(), 4);
-    assert_eq!(
-        codex_metadata["declared"]["context_window"],
-        json!(1_000_000)
-    );
-    assert_eq!(codex_metadata["declared"]["shell_type"], "shell_command");
-    assert_eq!(
-        codex_metadata["declared"]["apply_patch_tool_type"],
-        "freeform"
-    );
-    // Constant fields Codex requires: a typo here would fail its decode, so pin them.
-    assert_eq!(codex_metadata["declared"]["visibility"], "list");
-    assert_eq!(codex_metadata["declared"]["supported_in_api"], json!(true));
-    assert_eq!(codex_metadata["declared"]["web_search_tool_type"], "text");
-    assert_eq!(
-        codex_metadata["declared"]["input_modalities"],
-        json!(["text"])
-    );
-    assert_eq!(
-        codex_metadata["declared"]["truncation_policy"],
-        json!({"mode": "tokens", "limit": 10_000})
-    );
-    assert_eq!(
-        codex_metadata["restricted"]["context_window"],
-        json!(262_000)
-    );
-    assert_eq!(codex_metadata["restricted"]["shell_type"], "disabled");
-    assert_eq!(
-        codex_metadata["restricted"]["apply_patch_tool_type"],
-        json!(null)
-    );
-    // A reasoning route advertises the effort presets and reasoning controls.
-    assert_eq!(
-        codex_metadata["reasoning"]["default_reasoning_level"],
-        "xhigh"
-    );
-    assert_eq!(
-        codex_metadata["reasoning"]["supported_reasoning_levels"]
-            .as_array()
-            .map(Vec::len),
-        Some(4)
-    );
-    assert_eq!(
-        codex_metadata["reasoning"]["supports_reasoning_summaries"],
-        json!(true)
-    );
-    assert_eq!(
-        codex_metadata["reasoning"]["support_verbosity"],
-        json!(true)
-    );
-    assert_eq!(codex_metadata["reasoning"]["default_verbosity"], "low");
-    // An undeclared route: null context window, non-reasoning, but tools default on so Codex
-    // remains usable when connected directly to the server.
-    assert_eq!(codex_metadata["undeclared"]["context_window"], json!(null));
-    assert_eq!(
-        codex_metadata["undeclared"]["supported_reasoning_levels"],
-        json!([])
-    );
-    assert_eq!(
-        codex_metadata["undeclared"]["default_reasoning_level"],
-        json!(null)
-    );
-    assert_eq!(
-        codex_metadata["undeclared"]["supports_reasoning_summaries"],
-        json!(false)
-    );
-    assert_eq!(codex_metadata["undeclared"]["shell_type"], "shell_command");
-    assert_eq!(
-        codex_metadata["undeclared"]["apply_patch_tool_type"],
-        "freeform"
-    );
-    assert_eq!(
-        codex_metadata["undeclared"]["supports_parallel_tool_calls"],
-        json!(true)
-    );
+    assert_eq!(capabilities["declared"]["vision"], json!(true));
+    assert_eq!(capabilities["restricted"]["vision"], json!(false));
+    assert_eq!(capabilities["undeclared"]["vision"], json!(null));
+    assert_eq!(body["models"], json!([]));
+
     Ok(())
 }
 
@@ -3265,11 +3336,65 @@ async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> T
 }
 
 #[tokio::test]
+async fn random_zero_weight_target_is_not_advertised_or_called() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(weighted_random_state(&upstream.base_url, [1, 0])?);
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": ROUTE_MODEL,
+                "messages": [{"role": "user", "content": "unavailable"}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let decision = response.json()?;
+    assert_eq!(decision["selected"]["target"], "first");
+    assert_eq!(decision["fallbacks"], json!([]));
+    assert!(upstream.models().await.is_empty());
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": ROUTE_MODEL,
+                "messages": [{"role": "user", "content": "unavailable"}]
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": ROUTE_MODEL,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "unavailable"}]
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": ROUTE_MODEL, "input": "unavailable"}),
+        ),
+    ] {
+        upstream.calls.lock().await.clear();
+        let response = send(&app, "POST", path, Some(body)).await?;
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upstream.models().await, ["model/weak"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
     let log_path = temp_dir.path().join("routing.jsonl");
-    let state = fallback_state(&upstream.base_url)?.with_routing_log(&log_path)?;
+    // The fixed seed selects `first` for these requests while keeping `second` enabled.
+    let state =
+        weighted_random_state(&upstream.base_url, [1000, 1])?.with_routing_log(&log_path)?;
     let app = build_switchyard_router(state);
     let cases = [
         (
@@ -4310,77 +4435,5 @@ async fn upstream_headers_forward_on_streaming_responses() -> TestResult {
             .and_then(|value| value.to_str().ok()),
         Some("model/a")
     );
-    Ok(())
-}
-
-// Verifies a route declaring `vision = true` advertises image input, and that an
-// undeclared route still fails closed to text-only.
-//
-// This is not cosmetic metadata. Codex reads `input_modalities` from the model card
-// and, when it reads text-only, replaces an attached image with the literal text
-// "image content omitted because you do not support image input" before sending — so
-// a route whose target can see but which does not say so loses the image in the
-// client, and Switchyard never receives one to forward.
-#[tokio::test]
-async fn models_endpoint_advertises_image_input_only_for_vision_routes() -> TestResult {
-    const CONFIG: &str = r#"
-schema_version = 1
-
-[llm_clients.shared]
-format = "openai_responses"
-base_url = "http://127.0.0.1:1/v1"
-
-[targets.shared]
-id = "shared-model"
-llm_client = "shared"
-
-[routes.sees]
-id = "sees"
-type = "passthrough"
-target = "shared"
-vision = true
-
-[routes.blind]
-id = "blind"
-type = "passthrough"
-target = "shared"
-"#;
-    let app = build_switchyard_router(load_test_config(CONFIG)?);
-    let models = send(&app, "GET", "/v1/models", None).await?;
-    assert_eq!(models.status, StatusCode::OK);
-    let body = models.json()?;
-
-    let codex_metadata = body["models"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|entry| {
-            entry["slug"]
-                .as_str()
-                .map(|slug| (slug.to_string(), entry.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        codex_metadata["sees"]["input_modalities"],
-        json!(["text", "image"])
-    );
-    assert_eq!(codex_metadata["blind"]["input_modalities"], json!(["text"]));
-
-    // The OpenAI `data` entry reports the raw Option, so an undeclared route stays
-    // distinguishable from one that declared `false`.
-    let capabilities = body["data"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|entry| {
-            entry["id"]
-                .as_str()
-                .map(|id| (id.to_string(), entry["capabilities"].clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(capabilities["sees"]["vision"], json!(true));
-    assert_eq!(capabilities["blind"]["vision"], json!(null));
     Ok(())
 }

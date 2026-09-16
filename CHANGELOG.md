@@ -121,6 +121,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cross-format tool results keep image and file content** — an Anthropic
+  `tool_result` carrying image or document blocks reached a Responses target
+  as text only, and an image-only result became an empty `output`. In the other
+  direction a Responses `function_call_output` whose `output` was an array of
+  `input_text`, `input_image`, and `input_file` parts reached an Anthropic
+  target as one JSON string. Both directions now carry typed text, image, and
+  file blocks; plain-text results are unchanged. OpenAI `file_data` encodes as
+  a valid Anthropic `document`: raw base64 with a `media_type`, the data-URI
+  prefix stripped, and the file name as `title`.
+- **Stored Responses tool continuations stay on the selected model** — a
+  `function_call_output` sent with `previous_response_id`, where the matching
+  `function_call` lives in provider state, was decoded as ordinary user text. A
+  route with `classify_trigger = "user_turn"` then judged the turn again and
+  could switch models mid tool loop, and a Responses upstream received a user
+  message instead of the tool output. The output now stays a tool result, and
+  a stored `custom_tool_call_output` keeps its type when re-encoded. An output
+  with no matching call and no `previous_response_id` still degrades to
+  readable user text.
+- **Return HTTP 502 for failed Responses generations** — a provider's HTTP 200
+  response with `status: "failed"` could appear as an empty successful answer.
+  Switchyard now counts the call as an error and tries another model when the
+  route supports fallback. If this failure reaches the application, Chat
+  Completions, Anthropic Messages, and Responses return HTTP 502. Error replies
+  preserve the provider's message and, for OpenAI applications, a nonempty
+  string error code. Switchyard removes echoed caller credentials.
+- **Chat tool-call index counts tool calls, not content blocks** — the OpenAI
+  Chat stream encoder copied the source index into `tool_calls[].index`.
+  Anthropic and Responses index the whole content array, so text ahead of the
+  first tool call pushed the sole call to index 1, and the official OpenAI SDK,
+  which subscripts its `tool_calls` array with that index, raised `IndexError`.
+  Tool calls are now numbered within the Chat `tool_calls` array in order of
+  first appearance.
 - **Advisor stall checkpoint re-arms after a refunded review** — a
   stall-triggered consult that failed open or returned an unparseable verdict
   refunded the review budget but left the conversation's stall latch set, so
@@ -135,6 +167,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool. The decoder now reports `tool_use` when the completed output holds
   a `function_call` or `custom_tool_call`, or when it already decoded tool
   deltas, matching the buffered decoder.
+- **Harnesses without sub-agent identity on sub-agent routes** — Claude Code
+  sends the child identity header (`x-claude-code-agent-id`) that sub-agent
+  routing needs only from version 2.1.139. Older builds send just the session
+  id, so their sub-agent requests silently routed through the parent route.
+  Header normalization now flags such builds on
+  `switchyard_protocol::Metadata` as `subagent_identity_unsupported`, a route
+  with a `subagents` table logs one warning when it sees one, and the sub-agent
+  routing guide states the version floor. The new public field means downstream
+  code that builds `Metadata` with a full struct literal must add it or use
+  `..Metadata::default()`.
 - **Encrypted-only reasoning items open no summary part** — the Responses
   stream encoder opened a `reasoning_summary_part` for every reasoning item and
   closed it only when text had streamed, so an encrypted-only item left a part
