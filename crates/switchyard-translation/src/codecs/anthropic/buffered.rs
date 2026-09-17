@@ -5,7 +5,9 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::codecs::common::{is_known_role_name, provider_extensions, text_from_blocks};
+use crate::codecs::common::{
+    ANTHROPIC_REQUEST_KEY, is_known_role_name, provider_extensions, text_from_blocks,
+};
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
@@ -157,6 +159,10 @@ impl FormatCodec for AnthropicMessagesCodec {
                 "stream",
             ],
         );
+        request
+            .extensions
+            .fields
+            .insert(ANTHROPIC_REQUEST_KEY.to_string(), Value::Bool(true));
 
         Ok(DecodedRequest {
             request,
@@ -215,10 +221,26 @@ impl FormatCodec for AnthropicMessagesCodec {
                 encode_anthropic_tool_choice(choice),
             );
         }
+        if request.extensions.fields.get(ANTHROPIC_REQUEST_KEY) == Some(&Value::Bool(true)) {
+            for field in [
+                "inference_geo",
+                "service_tier",
+                "stop_sequences",
+                "metadata",
+                "cache_control",
+                "container",
+                "speed",
+                "diagnostics",
+            ] {
+                if let Some(value) = request.extensions.fields.get(field) {
+                    body.insert(field.to_string(), value.clone());
+                }
+            }
+        }
         if let Some(stop_sequences) =
             anthropic_stop_sequences_from_extensions(&request.extensions.fields)
         {
-            body.insert("stop_sequences".to_string(), stop_sequences);
+            body.entry("stop_sequences").or_insert(stop_sequences);
         }
         if let Some(max_tokens) = request.output.max_output_tokens {
             body.insert("max_tokens".to_string(), json!(max_tokens));
@@ -296,6 +318,7 @@ impl FormatCodec for AnthropicMessagesCodec {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             outputs: vec![ResponseOutput {
+                url_citations: Vec::new(),
                 role: Role::Assistant,
                 content,
                 stop_reason: Some(map_anthropic_stop_reason(
@@ -907,11 +930,15 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
                         .collect(),
                 )
             };
-            vec![json!({
+            let mut item = json!({
                 "type": "tool_result",
                 "tool_use_id": sanitize_anthropic_tool_use_id(&result.tool_call_id),
                 "content": content,
-            })]
+            });
+            if let Some(is_error) = result.is_error {
+                item["is_error"] = Value::Bool(is_error);
+            }
+            vec![item]
         }
         ContentBlock::Image { source } => vec![match source {
             ImageSource::Url { url, .. } => match split_base64_data_uri(url) {

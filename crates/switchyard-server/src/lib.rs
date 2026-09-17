@@ -962,9 +962,14 @@ fn llm_json_body(
 fn resolve_route(
     state: &ServerState,
     metadata: Metadata,
-    body: Value,
+    mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    // Only trusted translation hops may supply exact request preservation state.
+    // Strip it before decoding and retaining the raw body for upstream replay.
+    if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
+    }
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
@@ -1040,7 +1045,18 @@ async fn handle_llm_request(
 
     let output = match route.execute(request, Some(observer)).await {
         Ok(output) => output,
-        Err(error) => return runner_error(error),
+        Err(error) => {
+            if let RunnerError::Algorithm(LibsyError::ClientCall {
+                target,
+                source:
+                    LlmClientError::ResponseStateLimitExceeded { .. }
+                    | LlmClientError::ResponseStateConflict,
+            }) = &error
+            {
+                state.stats.record_response_error(target);
+            }
+            return runner_error(error);
+        }
     };
     let RunOutput {
         selected_model,
@@ -1245,6 +1261,18 @@ fn runner_error(error: RunnerError) -> Response {
 
 fn client_error(error: &LlmClientError) -> Response {
     match error {
+        LlmClientError::ResponseStateLimitExceeded { .. } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "server_error",
+            "response_state_limit_exceeded",
+        ),
+        LlmClientError::ResponseStateConflict => error_response(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "server_error",
+            "response_state_conflict",
+        ),
         LlmClientError::InvalidRequest { message }
         | LlmClientError::RequestTranslation(message) => error_response(
             StatusCode::BAD_REQUEST,
