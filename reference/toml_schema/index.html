@@ -686,6 +686,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../routing_algorithms/llm_classifier_routing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Task (LLM Classifier)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../routing_algorithms/stage_router_routing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Execution (Stage Router)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../routing_algorithms/subagent_routing/" class="md-nav__link">
         
   
@@ -722,62 +778,6 @@
     
   
     Random Routing
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../routing_algorithms/llm_classifier_routing/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    LLM Classifier Routing
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../routing_algorithms/stage_router_routing/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Stage-Router Routing
   
 
     
@@ -1771,10 +1771,14 @@ endpoint, before it calls an upstream.</p>
 <td><code>reasoning_effort</code></td>
 <td style="text-align: center;">No</td>
 <td>unset</td>
-<td>Reasoning effort forced on every request to this target, replacing the value the caller sent (<code>reasoning.effort</code> on <code>openai_responses</code>, <code>reasoning_effort</code> on <code>openai_chat</code>). Rejected on <code>anthropic_messages</code> clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at <code>max</code> behind a client that sends <code>high</code>. Two targets for the same model id on the same <code>llm_client</code> collapse into one, so give each effort tier its own <code>llm_clients</code> entry (same endpoint, different name).</td>
+<td>Reasoning effort forced on every request to this target, replacing the value the caller sent (<code>reasoning.effort</code> on <code>openai_responses</code>, <code>reasoning_effort</code> on <code>openai_chat</code>). Rejected on <code>anthropic_messages</code> clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at <code>max</code> behind a client that sends <code>high</code>. Targets with different effort settings need distinct model IDs when used within one route. Separate routes may use the same model ID with separate <code>llm_clients</code> entries (same endpoint, different name).</td>
 </tr>
 </tbody>
 </table>
+<p>Within one route, callable targets with the same model ID must use the same <code>llm_client</code>.
+This includes completion targets and targets used for judging or classification. Switchyard rejects
+same-model targets on different clients within a route because execution is keyed by model ID.
+Separate routes may use the same model ID on different clients.</p>
 <p>Each selected or fallback target is prepared from the routed request independently. A prompt
 configured for one target is therefore not carried into another target's fallback request.
 Judge-only, classifier-only, and reviewer-only targets are not completion destinations and do not
@@ -1905,6 +1909,14 @@ see <a href="../../routing_algorithms/subagent_routing/">Sub-Agent-Aware Routing
 </tbody>
 </table>
 <h3 id="prefill_router"><code>prefill_router</code><a class="headerlink" href="#prefill_router" title="Permanent link">&para;</a></h3>
+<div class="admonition warning">
+<p class="admonition-title">Experimental in v0.3.0</p>
+<p>Switchyard v0.3.0 does not provide or support a router checkpoint, an
+exporter, or compatible encoder assets. You must obtain or train a compatible
+checkpoint and obtain its encoder and tokenizer yourself. There is no
+supported end-to-end checkpoint export and compatibility contract.
+The example below shows configuration syntax, not a ready-to-run deployment.</p>
+</div>
 <p>Routes the latest non-empty user message with a checkpoint-backed prefill classifier. Build
 <code>switchyard-server</code> with <code>--features prefill-router</code> and make the prefill router's Python
 dependencies available in the active virtual environment.</p>
