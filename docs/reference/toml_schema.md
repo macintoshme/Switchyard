@@ -105,7 +105,12 @@ endpoint, before it calls an upstream.
 | `llm_client` | Yes | — | Key under `[llm_clients]`. |
 | `system_prompt` | No | unset | System prompt prepended when this target serves a completion. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
-| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Two targets for the same model id on the same `llm_client` collapse into one, so give each effort tier its own `llm_clients` entry (same endpoint, different name). |
+| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Targets with different effort settings need distinct model IDs when used within one route. Separate routes may use the same model ID with separate `llm_clients` entries (same endpoint, different name). |
+
+Within one route, callable targets with the same model ID must use the same `llm_client`.
+This includes completion targets and targets used for judging or classification. Switchyard rejects
+same-model targets on different clients within a route because execution is keyed by model ID.
+Separate routes may use the same model ID on different clients.
 
 Each selected or fallback target is prepared from the routed request independently. A prompt
 configured for one target is therefore not carried into another target's fallback request.
@@ -171,6 +176,14 @@ Splits traffic across targets. See
 | `seed` | No | unset | Reproduces the selection sequence. |
 
 ### `prefill_router`
+
+!!! warning "Experimental in v0.3.0"
+
+    Switchyard v0.3.0 does not provide or support a router checkpoint, an
+    exporter, or compatible encoder assets. You must obtain or train a compatible
+    checkpoint and obtain its encoder and tokenizer yourself. There is no
+    supported end-to-end checkpoint export and compatibility contract.
+    The example below shows configuration syntax, not a ready-to-run deployment.
 
 Routes the latest non-empty user message with a checkpoint-backed prefill classifier. Build
 `switchyard-server` with `--features prefill-router` and make the prefill router's Python

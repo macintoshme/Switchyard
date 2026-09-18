@@ -140,6 +140,27 @@ async fn upstream_chat(
     }
 
     let model = body["model"].as_str().unwrap_or("unknown").to_string();
+    if model == "model/classifier" {
+        let mut pending = HashSet::new();
+        for message in body["messages"].as_array().into_iter().flatten() {
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                if let Some(id) = call["id"].as_str() {
+                    pending.insert(id);
+                }
+            }
+            if message["role"] == "tool"
+                && !pending.remove(message["tool_call_id"].as_str().unwrap_or_default())
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {
+                        "message": "tool result has no preceding assistant tool call"
+                    }})),
+                )
+                    .into_response();
+            }
+        }
+    }
     if prompt == "retry-once"
         && calls
             .lock()
@@ -2587,6 +2608,113 @@ prompt = "CUSTOM STAGE"
 }
 
 #[tokio::test]
+async fn classifier_task_input_excludes_tool_results_across_request_formats() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+[targets.judge]
+id = "model/classifier"
+llm_client = "upstream"
+[targets.strong]
+id = "model/strong"
+llm_client = "upstream"
+[targets.weak]
+id = "model/weak"
+llm_client = "upstream"
+[routes.task]
+id = "task"
+type = "llm_classifier"
+classifier_target = "judge"
+strong_target = "strong"
+weak_target = "weak"
+base_threshold = 0.5
+classify_trigger = "every_request"
+[routes.window]
+id = "window"
+type = "llm_classifier"
+classifier_target = "judge"
+strong_target = "strong"
+weak_target = "weak"
+base_threshold = 0.5
+classify_trigger = "every_request"
+recent_turn_window = 1
+"#,
+        base_url = upstream.base_url
+    ))?);
+    let chat = json!({"messages": [
+        {"role": "user", "content": "Read the file."},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_read", "type": "function", "function": {"name": "read_file", "arguments": "{}"}
+        }]},
+        {"role": "tool", "tool_call_id": "call_read", "content": "File contents."}
+    ]});
+    for (route, endpoint, mut body) in [
+        ("task", "/v1/chat/completions", chat.clone()),
+        (
+            "task",
+            "/v1/messages",
+            json!({"messages": [
+                {"role": "user", "content": "Read the file."},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_read", "name": "read_file", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_read", "content": "File contents."}]}
+            ]}),
+        ),
+        (
+            "task",
+            "/v1/responses",
+            json!({"input": [
+                {"role": "user", "content": "Read the file."},
+                {"type": "function_call", "call_id": "call_read", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_read", "output": "File contents."}
+            ]}),
+        ),
+        ("window", "/v1/chat/completions", chat),
+    ] {
+        upstream.calls.lock().await.clear();
+        body["model"] = json!(route);
+        let response = send(&app, "POST", endpoint, Some(body)).await?;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text()?);
+        assert_eq!(
+            response.headers["x-model-router-selected-model"], "model/weak",
+            "{endpoint}"
+        );
+        let calls = upstream.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        let judge_roles: Vec<_> = calls[0]["messages"]
+            .as_array()
+            .ok_or("missing judge messages")?
+            .iter()
+            .map(|message| message["role"].clone())
+            .collect();
+        assert_eq!(
+            judge_roles,
+            if route == "task" {
+                json!(["system", "user"])
+            } else {
+                json!(["system", "user", "assistant", "tool", "user"])
+            }
+            .as_array()
+            .ok_or("missing expected roles")?
+            .clone()
+        );
+        assert_eq!(calls[1]["messages"][1]["tool_calls"][0]["id"], "call_read");
+        assert_eq!(calls[1]["messages"][2]["tool_call_id"], "call_read");
+    }
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["classifier"]["total_requests"], 4);
+    assert_eq!(
+        stats["classifier"]["models"]["model/classifier"]["errors"],
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn accepted_escalation_response_is_logged_once_as_the_final_answer() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
@@ -3464,7 +3592,8 @@ selector = "/decision/target"
     Ok(())
 }
 
-// Compaction uses the parent classifier; review tasks use the subagent worker.
+// Codex's structured kind takes precedence over the flat `collab_spawn` header:
+// maintenance uses the parent classifier; delegated work uses the subagent route.
 #[tokio::test]
 async fn codex_maintenance_uses_the_parent_classifier_across_apis() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -3490,6 +3619,7 @@ subagents = {{ type = "passthrough", target = "strong" }}
     let cases = [
         (Some("compact"), None, "model/weak"),
         (Some("review"), None, "model/strong"),
+        (Some("thread_spawn"), None, "model/strong"),
         (Some("collab_spawn"), None, "model/strong"),
         (Some("unknown"), None, "model/weak"),
         (Some("memory_consolidation"), None, "model/weak"),
@@ -3506,15 +3636,16 @@ subagents = {{ type = "passthrough", target = "strong" }}
         (
             "/v1/messages",
             json!({"model":"agent","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}),
-            &cases[..2],
+            &cases[..3],
         ),
         (
             "/v1/responses",
             json!({"model":"agent","input":"hi"}),
-            &cases[..2],
+            &cases[..3],
         ),
     ] {
         for (kind, explicit, expected) in cases {
+            let mut headers = Vec::new();
             let mut metadata = json!({
                 "thread_id": "child",
                 "parent_thread_id": "root",
@@ -3522,9 +3653,10 @@ subagents = {{ type = "passthrough", target = "strong" }}
             });
             if let Some(kind) = kind {
                 metadata["subagent_kind"] = json!(kind);
+                headers.push(("x-openai-subagent", "collab_spawn"));
             }
             let metadata = metadata.to_string();
-            let mut headers = vec![("x-codex-turn-metadata", metadata.as_str())];
+            headers.push(("x-codex-turn-metadata", metadata.as_str()));
             if let Some(explicit) = explicit {
                 headers.push(("x-switchyard-is-subagent", explicit));
             }
@@ -3538,7 +3670,7 @@ subagents = {{ type = "passthrough", target = "strong" }}
     for (model, expected) in [
         ("model/classifier", 7),
         ("model/weak", 7),
-        ("model/strong", 5),
+        ("model/strong", 8),
     ] {
         assert_eq!(
             models.iter().filter(|actual| *actual == model).count(),
@@ -4167,6 +4299,8 @@ async fn streaming_error_records_error_without_usage_or_latency() -> TestResult 
     let after = send(&app, "GET", "/metrics", None).await?;
     let after = after.text()?;
     for name in [
+        "switchyard_requests_total",
+        "switchyard_model_call_latency_ms_count",
         "switchyard_prompt_tokens_total",
         "switchyard_completion_tokens_total",
         "switchyard_cached_tokens_total",
@@ -4189,6 +4323,7 @@ async fn streaming_error_records_error_without_usage_or_latency() -> TestResult 
         ),
         Some(1.0)
     );
+    assert!(metric_delta(before, after, "switchyard_total_errors", &[]).unwrap_or_default() >= 1.0);
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
     assert_eq!(stats["total_requests"], 1);
     assert_eq!(stats["total_errors"], 1);
@@ -4222,6 +4357,7 @@ async fn responses_stream_error_does_not_emit_success_terminal_events() -> TestR
     let body = response.text()?;
     assert_in_order(body, &["before", "upstream stream failed"]);
     for event_type in [
+        "response.output_text.done",
         "response.content_part.done",
         "response.output_item.done",
         "response.completed",
@@ -4750,13 +4886,10 @@ fn sse_events(body: &str) -> Vec<Value> {
         .collect()
 }
 
-// The end-to-end contract for Codex tool namespaces, in one request.
-//
-// Two MCP servers expose the same tool name, so the flat upstream can only tell
-// them apart by the namespace folded into each name. Everything naming a tool —
-// the definitions, the recorded call in history, and the forced tool choice —
-// has to use that same spelling, and the response has to split it back into the
-// name and namespace Codex dispatches on.
+// Two MCP servers expose `search`, so the upstream needs a qualified name for
+// each tool. Tool definitions, history, and the forced tool choice must use the
+// same qualified names. Response items and argument completions must contain
+// the tool name and namespace that Codex uses to select the tool.
 #[tokio::test]
 async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
     const MODEL: &str = "model/mcp-namespaces";
@@ -4830,6 +4963,17 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
         assert_eq!(item["name"], "search", "{event_type}");
         assert_eq!(item["namespace"], "mcp__b", "{event_type}");
     }
+    let arguments_done = events
+        .iter()
+        .find(|event| event["type"] == "response.function_call_arguments.done");
+    assert_eq!(
+        arguments_done.map(|event| &event["name"]),
+        Some(&json!("search"))
+    );
+    assert_eq!(
+        arguments_done.map(|event| &event["namespace"]),
+        Some(&json!("mcp__b"))
+    );
     let completed = events
         .iter()
         .find(|event| event["type"] == "response.completed")

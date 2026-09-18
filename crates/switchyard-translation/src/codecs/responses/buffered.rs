@@ -29,8 +29,8 @@ use crate::llm::{
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
-    exact_preserved_request, exact_preserved_response, json_string, push_lossy, stable_id,
-    string_value, validate_request_capabilities,
+    exact_preserved_request, exact_preserved_response, is_responses_builtin_tool_item, json_string,
+    push_lossy, stable_id, string_value, validate_request_capabilities,
 };
 
 /// Format codec for OpenAI Responses payloads.
@@ -256,8 +256,18 @@ impl FormatCodec for OpenAiResponsesCodec {
                 json!({"format": encode_responses_text_format(response_format)}),
             );
         }
+        let mut reasoning = request
+            .reasoning
+            .raw
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         if let Some(effort) = &request.reasoning.effort {
-            body.insert("reasoning".to_string(), json!({"effort": effort}));
+            reasoning.insert("effort".to_string(), json!(effort));
+        }
+        if !reasoning.is_empty() {
+            body.insert("reasoning".to_string(), Value::Object(reasoning));
         }
         if let Some(value) = request.sampling.temperature {
             body.insert("temperature".to_string(), json!(value));
@@ -480,8 +490,26 @@ fn decode_responses_input(
                             item.get("role").and_then(Value::as_str),
                             &format!("$.input[{index}].role"),
                         )?;
-                        let content =
-                            decode_responses_content(item.get("content").unwrap_or(&Value::Null));
+                        let content_value = item.get("content").unwrap_or(&Value::Null);
+                        if is_responses_builtin_tool_item(content_value) {
+                            return Err(TranslationError::InvalidValue {
+                                path: format!("$.input[{index}].content.type"),
+                                message:
+                                    "built-in tool items must be top-level Responses input items"
+                                        .to_string(),
+                            });
+                        }
+                        if let Some(content_index) = content_value.as_array().and_then(|blocks| {
+                            blocks.iter().position(is_responses_builtin_tool_item)
+                        }) {
+                            return Err(TranslationError::InvalidValue {
+                                path: format!("$.input[{index}].content[{content_index}].type"),
+                                message:
+                                    "built-in tool items must be top-level Responses input items"
+                                        .to_string(),
+                            });
+                        }
+                        let content = decode_responses_content(content_value);
                         // Inline system and developer input items are instructions, not
                         // conversation turns. Classify them before any state-machine
                         // transitions so they do not flush pending reasoning or disturb
@@ -879,6 +907,9 @@ fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
                             out.push(ContentBlock::Image { source });
                         }
                     }
+                    Some("input_audio") => out.push(ContentBlock::Audio {
+                        source: MediaSource::Raw(Value::Object(block.clone())),
+                    }),
                     Some("input_file") => out.push(ContentBlock::File {
                         source: decode_file_source(block),
                     }),
@@ -1217,6 +1248,16 @@ fn encode_responses_input(
         }
     }
     for message in messages {
+        // The decoder carries each valid top-level built-in tool item as one
+        // provider-qualified block, so replay that block in place.
+        if message.role == Role::User
+            && let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
+            && provider.as_str() == WireFormat::OpenAiResponses.as_str()
+            && is_responses_builtin_tool_item(raw)
+        {
+            encoded.push(raw.clone());
+            continue;
+        }
         // Anthropic-signed thinking cannot be sent as Responses input.
         let content = message
             .content
@@ -1499,18 +1540,9 @@ fn encode_responses_content(
                     blocks.push(json!({"type": "input_text", "text": image_source_text(source)}));
                 }
             },
-            ContentBlock::Audio { source } => blocks.push(match source {
-                MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
-                MediaSource::Url { url, media_type } => json!({
-                    "type": "input_audio",
-                    "audio_url": url,
-                    "media_type": media_type,
-                }),
-                MediaSource::Base64 { media_type, data } => json!({
-                    "type": "input_audio",
-                    "audio": {"media_type": media_type, "data": data},
-                }),
-            }),
+            ContentBlock::Audio { source } => {
+                blocks.push(crate::codecs::openai_media::audio_part(source)?);
+            }
             ContentBlock::Video { source } => blocks.push(match source {
                 MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
                 MediaSource::Url { url, media_type } => json!({
@@ -1570,6 +1602,12 @@ fn encode_responses_tool_output(
 }
 
 fn responses_image_part(source: &ImageSource) -> Option<Value> {
+    if let ImageSource::Raw(raw) = source
+        && raw.get("type").and_then(Value::as_str) == Some("input_image")
+        && raw.get("file_id").and_then(Value::as_str).is_some()
+    {
+        return Some(raw.clone());
+    }
     let ImagePayload { url, detail } = image_payload(source)?;
     let mut part = json!({"type": "input_image"});
     part["image_url"] = Value::String(url);
@@ -1905,15 +1943,30 @@ fn decode_responses_usage(value: Option<&Value>) -> Usage {
         .or_else(|| value.get("prompt_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64);
-    let input_tokens = aggregate_input_tokens
-        .map(|tokens| tokens.saturating_sub(cached_input_tokens.unwrap_or(0)));
+    let cache_creation_input_tokens = value
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value.get("prompt_tokens_details").and_then(|details| {
+                details
+                    .get("cache_write_tokens")
+                    .and_then(Value::as_u64)
+                    .or_else(|| details.get("cache_creation_tokens").and_then(Value::as_u64))
+            })
+        });
+    let input_tokens = aggregate_input_tokens.map(|tokens| {
+        tokens
+            .saturating_sub(cached_input_tokens.unwrap_or(0))
+            .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+    });
     let output_tokens = value
         .get("output_tokens")
         .or_else(|| value.get("completion_tokens"))
         .and_then(Value::as_u64);
     Usage {
         input_tokens,
-        cache: Usage::cache_details(cached_input_tokens, None),
+        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
         output_tokens,
         total_tokens: value
             .get("total_tokens")
@@ -1951,7 +2004,10 @@ fn encode_responses_usage(usage: &Usage) -> Value {
             .total_tokens
             .or_else(|| Some(input_tokens + usage.output_tokens.unwrap_or(0)))
             .unwrap_or(0),
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens().unwrap_or(0)},
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens().unwrap_or(0),
+            "cache_write_tokens": usage.cache_creation_input_tokens().unwrap_or(0),
+        },
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
     })
 }
@@ -1968,6 +2024,7 @@ fn copy_responses_request_extensions(
     extensions: &Map<String, Value>,
 ) {
     for field in [
+        "include",
         "metadata",
         "parallel_tool_calls",
         "previous_response_id",

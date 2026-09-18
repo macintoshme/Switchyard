@@ -41,7 +41,8 @@ use crate::{metrics, observability};
 /// Run one request to completion, serving every offloaded model call with `client`.
 ///
 /// Returns the model selected by the algorithm and the final [`Response`]. `observer`, when
-/// present, receives each completed routing or answer call and the routing overhead.
+/// present, receives metadata for the routing outcome, each completed routing or answer call,
+/// and the routing overhead.
 ///
 /// `clients` resolves each offloaded call to the client for the target the algorithm
 /// selected — an algorithm may route among targets served by different providers, so this is
@@ -84,6 +85,11 @@ pub async fn run(
     metrics::record_routing_overhead(&algorithm_name, overhead);
 
     let selected_model_id = outcome.selected_model_id()?.clone();
+    if let Some(observer) = &observer
+        && let Some(metadata) = outcome.metadata
+    {
+        observer(RunObservation::Outcome(metadata));
+    }
     let (result, answer_duration) = if let Some(response) = outcome.response {
         (Ok(response), None)
     } else {
@@ -102,17 +108,16 @@ pub async fn run(
         )
         .await;
         let answer_duration = answer_started.elapsed();
-        metrics::record_answer_call(
-            &algorithm_name,
-            &selected_model_id,
-            answer_duration,
-            &result,
-        );
         (result, Some(answer_duration))
     };
     let result =
         result.and_then(|response| clients.remember_state_owner(&outcome.request, response));
-    metrics::record_routed_request(&selected_model_id, answer_duration, &result);
+    let result = metrics::observe_routed_request(
+        &algorithm_name,
+        &selected_model_id,
+        answer_duration,
+        result,
+    );
     if let Some(observer) = &observer {
         observer(RunObservation::RoutingOverhead(overhead));
     }
@@ -362,6 +367,16 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
         LlmClientError::Transport { .. } => Some(RoutingFallbackReason::Unavailable),
+        // A policy denial can be specific to one provider. Preserve its HTTP
+        // error, but allow another candidate to serve the request.
+        LlmClientError::UpstreamHttp { status, body }
+            if *status == StatusCode::BAD_REQUEST
+                && serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+                    value["error"]["code"].as_str() == Some("content_policy_violation")
+                }) =>
+        {
+            Some(RoutingFallbackReason::Unavailable)
+        }
         LlmClientError::UpstreamHttp { status, .. }
             if matches!(
                 *status,
@@ -757,6 +772,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FirstOutcome {
         ContextWindow,
+        ContentPolicy,
         Unauthorized,
         StreamSuccess,
         MidStreamError,
@@ -779,6 +795,10 @@ mod tests {
                     FirstOutcome::ContextWindow => Err(LlmClientError::ContextWindowExceeded {
                         model,
                         message: "too long".to_string(),
+                    }),
+                    FirstOutcome::ContentPolicy => Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::BAD_REQUEST,
+                        body: r#"{"error":{"code":"content_policy_violation","message":"request blocked by content policy","type":"invalid_request_error"},"metadata":{"documentation_section":"context window"}}"#.to_string(),
                     }),
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
@@ -908,9 +928,13 @@ mod tests {
         assert!(matches!(observations[0], RunObservation::AnswerCall(_)));
         assert!(matches!(
             observations[1],
+            RunObservation::Outcome(ref metadata) if metadata.algorithm == "answered_test"
+        ));
+        assert!(matches!(
+            observations[2],
             RunObservation::RoutingOverhead(_)
         ));
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 3);
         Ok(())
     }
 
@@ -1242,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_only_accepts_context_and_unavailable_failures() {
+    fn fallback_only_accepts_context_policy_and_unavailable_failures() {
         let error = |source| LibsyError::client_call("target", source);
         assert_eq!(
             fallback_reason(&error(LlmClientError::ContextWindowExceeded {
@@ -1264,6 +1288,27 @@ mod tests {
                     body: "failed".to_string(),
                 })),
                 Some(RoutingFallbackReason::Unavailable)
+            );
+        }
+        for (body, expected) in [
+            (
+                r#"{"error":{"code":"content_policy_violation"}}"#,
+                Some(RoutingFallbackReason::Unavailable),
+            ),
+            (
+                r#"{"error":{"code":"invalid_request_error"},"metadata":"content_policy_violation"}"#,
+                None,
+            ),
+            (r#"{"error":{"message":"content_policy_violation"}}"#, None),
+            ("content_policy_violation", None),
+        ] {
+            assert_eq!(
+                fallback_reason(&error(LlmClientError::UpstreamHttp {
+                    status: StatusCode::BAD_REQUEST,
+                    body: body.to_string(),
+                })),
+                expected,
+                "{body}"
             );
         }
         for status in [
@@ -1299,6 +1344,15 @@ mod tests {
                 .as_agg()
                 .map(|response| response.model.as_deref()),
             Some(Some("strong"))
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+
+        // A provider-specific policy denial also permits another candidate.
+        let (client, result) = run_candidates(FirstOutcome::ContentPolicy).await;
+        let (_, response) = result?;
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()]
         );
         assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
 

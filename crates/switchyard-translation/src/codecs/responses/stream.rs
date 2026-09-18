@@ -405,21 +405,31 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
     if state.response_text_started
         && let Some(output_index) = state.response_text_output_index
     {
+        let item_id = responses_item_id(state, "msg", output_index);
         out.push(json!({
-            "type": "response.content_part.done",
+            "type": "response.output_text.done",
+            "item_id": item_id,
             "output_index": output_index,
             "content_index": 0,
-            "part": {"type": "output_text", "text": state.response_text},
+            "text": state.response_text,
+            "logprobs": [],
+        }));
+        out.push(json!({
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []},
         }));
         out.push(json!({
             "type": "response.output_item.done",
             "output_index": output_index,
             "item": {
                 "type": "message",
-                "id": responses_item_id(state, "msg", output_index),
+                "id": item_id,
                 "role": "assistant",
                 "status": status,
-                "content": [{"type": "output_text", "text": state.response_text}],
+                "content": [{"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []}],
             },
         }));
     }
@@ -484,7 +494,7 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
                 "id": responses_item_id(state, "msg", output_index),
                 "role": "assistant",
                 "status": status,
-                "content": [{"type": "output_text", "text": state.response_text}],
+                "content": [{"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []}],
             }),
         ));
     }
@@ -494,14 +504,20 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
             continue;
         }
         let output_index = tool.response_output_index.unwrap_or(0);
+        let item_id = tool
+            .response_item_id
+            .clone()
+            .unwrap_or_else(|| responses_item_id(state, "fc", output_index));
         out.push(json!({
             "type": "response.function_call_arguments.done",
+            "item_id": item_id,
             "output_index": output_index,
+            "name": tool.name.clone().unwrap_or_default(),
             "arguments": tool.arguments,
         }));
         let item = json!({
             "type": "function_call",
-            "id": tool.response_item_id.clone().unwrap_or_else(|| responses_item_id(state, "fc", output_index)),
+            "id": item_id,
             "call_id": tool.id.clone().unwrap_or_else(|| format!("call_{output_index}")),
             "name": tool.name.clone().unwrap_or_default(),
             "arguments": tool.arguments,
@@ -716,6 +732,10 @@ fn ensure_responses_created(state: &mut StreamTranslationState) -> Vec<Value> {
     if state.response_created {
         return Vec::new();
     }
+    // A provider ID learned later must not change an already published response or item ID.
+    if state.target_message_id.is_none() {
+        state.target_message_id = Some(responses_id(state));
+    }
     state.response_created = true;
     vec![json!({
         "type": "response.created",
@@ -788,17 +808,20 @@ fn encode_responses_text_delta(state: &mut StreamTranslationState, text: String)
         }));
         out.push(json!({
             "type": "response.content_part.added",
+            "item_id": responses_item_id(state, "msg", output_index),
             "output_index": output_index,
             "content_index": 0,
-            "part": {"type": "output_text", "text": ""},
+            "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []},
         }));
     }
     state.response_text.push_str(&text);
     out.push(json!({
         "type": "response.output_text.delta",
+        "item_id": responses_item_id(state, "msg", state.response_text_output_index.unwrap_or(0)),
         "output_index": state.response_text_output_index.unwrap_or(0),
         "content_index": 0,
         "delta": text,
+        "logprobs": [],
     }));
     out
 }
@@ -942,6 +965,7 @@ fn encode_responses_tool_delta(
         if !tool.pending_arguments.is_empty() {
             out.push(json!({
                 "type": "response.function_call_arguments.delta",
+                "item_id": tool.response_item_id,
                 "output_index": output_index,
                 "delta": tool.pending_arguments,
             }));
@@ -955,6 +979,7 @@ fn encode_responses_tool_delta(
     {
         out.push(json!({
             "type": "response.function_call_arguments.delta",
+            "item_id": tool.response_item_id,
             "output_index": output_index,
             "delta": tool.pending_arguments,
         }));
@@ -970,12 +995,19 @@ fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
         .get("input_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64);
-    let input_tokens = aggregate_input_tokens
-        .map(|tokens| tokens.saturating_sub(cached_input_tokens.unwrap_or(0)));
+    let cache_creation_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64);
+    let input_tokens = aggregate_input_tokens.map(|tokens| {
+        tokens
+            .saturating_sub(cached_input_tokens.unwrap_or(0))
+            .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+    });
     let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
     Usage {
         input_tokens,
-        cache: Usage::cache_details(cached_input_tokens, None),
+        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
         output_tokens,
         total_tokens: usage
             .get("total_tokens")
@@ -1006,7 +1038,10 @@ fn responses_usage_value(usage: &Usage) -> Value {
         "total_tokens": usage.total_tokens.unwrap_or_else(|| {
             input_tokens + usage.output_tokens.unwrap_or(0)
         }),
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens().unwrap_or(0)},
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens().unwrap_or(0),
+            "cache_write_tokens": usage.cache_creation_input_tokens().unwrap_or(0),
+        },
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
     })
 }

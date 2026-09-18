@@ -26,8 +26,8 @@ use crate::llm::{
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
-    exact_preserved_request, exact_preserved_response, json_string, object, push_lossy, stable_id,
-    string_value, validate_request_capabilities,
+    exact_preserved_request, exact_preserved_response, json_string, object, push_lossy,
+    reject_responses_builtin_tool_item, stable_id, string_value, validate_request_capabilities,
 };
 
 /// Format codec for OpenAI Chat Completions payloads.
@@ -546,6 +546,9 @@ pub(crate) fn decode_openai_content(
                             content.push(ContentBlock::Image { source });
                         }
                     }
+                    Some("input_audio") => content.push(ContentBlock::Audio {
+                        source: MediaSource::Raw(Value::Object(block.clone())),
+                    }),
                     Some("file") | Some("input_file") => {
                         content.push(ContentBlock::File {
                             source: decode_file_source(block),
@@ -606,7 +609,7 @@ pub(crate) fn decode_image_source(block: &Map<String, Value>) -> Option<ImageSou
                 .map(ToOwned::to_owned),
         });
     }
-    None
+    Some(ImageSource::Raw(Value::Object(block.clone())))
 }
 
 /// Decodes OpenAI file block shapes into normalized file sources.
@@ -1026,6 +1029,7 @@ pub(crate) fn encode_openai_content(
     }
     let mut blocks = Vec::new();
     for block in content {
+        crate::codecs::openai_media::validate_media(block, WireFormat::OpenAiChat)?;
         match block {
             ContentBlock::Text { text } => blocks.push(json!({"type": "text", "text": text})),
             ContentBlock::Refusal { text } => blocks.push(json!({"type": "text", "text": text})),
@@ -1052,12 +1056,7 @@ pub(crate) fn encode_openai_content(
                 }
             },
             ContentBlock::Audio { source } => {
-                push_lossy(
-                    diagnostics,
-                    policy,
-                    "OpenAI Chat codec does not have a stable audio request mapping yet",
-                )?;
-                blocks.push(openai_text_part(&media_source_text(source)));
+                blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
             ContentBlock::Video { source } => {
                 push_lossy(
@@ -1067,7 +1066,8 @@ pub(crate) fn encode_openai_content(
                 )?;
                 blocks.push(openai_text_part(&media_source_text(source)));
             }
-            ContentBlock::Unknown { raw, .. } => {
+            ContentBlock::Unknown { provider, raw } => {
+                reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
                 push_lossy(
                     diagnostics,
                     policy,

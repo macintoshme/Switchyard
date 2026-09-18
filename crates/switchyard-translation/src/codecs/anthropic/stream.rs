@@ -268,6 +268,16 @@ fn finish_anthropic_stream(state: &mut StreamTranslationState) -> Vec<Value> {
         }
     }
 
+    for index in std::mem::take(&mut state.deferred_anthropic_tools) {
+        out.extend(encode_anthropic_tool_delta(state, index, None, None, None));
+        if let Some(tool) = state.tool_states.get_mut(&index) {
+            if let Some(content_index) = tool.content_index {
+                out.push(json!({"type": "content_block_stop", "index": content_index}));
+            }
+            tool.started = false;
+        }
+    }
+
     if !state.emitted_content_block {
         out.push(json!({
             "type": "content_block_start",
@@ -471,6 +481,10 @@ fn encode_anthropic_tool_delta(
         state.text_block_started = false;
     }
 
+    let other_tool_started = state
+        .tool_states
+        .iter()
+        .any(|(&tool_index, tool)| tool_index != index && tool.started);
     let tool = state.tool_states.entry(index).or_default();
     if id.is_some() {
         tool.id = id.map(|id| sanitize_anthropic_tool_use_id(&id));
@@ -481,6 +495,14 @@ fn encode_anthropic_tool_delta(
     if let Some(delta) = arguments_delta {
         tool.arguments.push_str(&delta);
         tool.pending_arguments.push_str(&delta);
+    }
+
+    // Chat can interleave calls until EOF; Anthropic callbacks require one open block.
+    if other_tool_started {
+        if !state.deferred_anthropic_tools.contains(&index) {
+            state.deferred_anthropic_tools.push(index);
+        }
+        return out;
     }
 
     if !tool.started {
@@ -552,6 +574,14 @@ fn capture_anthropic_usage(state: &mut StreamTranslationState, usage: &Value) {
     if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
         state.usage.set_cached_input_tokens(value);
     }
+    if let Some(value) = usage.get("output_tokens_details").and_then(|details| {
+        details
+            .get("thinking_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| details.get("reasoning_tokens").and_then(Value::as_u64))
+    }) {
+        state.usage.reasoning_tokens = Some(value);
+    }
 }
 
 // Builds Anthropic usage payloads from normalized and provider-extra state.
@@ -573,6 +603,12 @@ fn anthropic_stream_usage(state: &StreamTranslationState) -> Value {
     }
     if let Some(value) = state.usage.cached_input_tokens() {
         usage.insert("cache_read_input_tokens".to_string(), json!(value));
+    }
+    if let Some(value) = state.usage.reasoning_tokens {
+        usage.insert(
+            "output_tokens_details".to_string(),
+            json!({"thinking_tokens": value}),
+        );
     }
     Value::Object(usage)
 }

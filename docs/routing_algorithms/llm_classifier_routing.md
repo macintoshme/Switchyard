@@ -1,13 +1,19 @@
 # LLM Classifier Routing
 
-LLM classifier routing supports capability classification, trajectory escalation,
-and custom schema-driven routing across two or more targets.
+**Task** routing uses the LLM classifier's `capability` mode to judge whether
+an efficient model can handle the task or a capable model is needed. Configure
+it with `type = "llm_classifier"` and `mode = "capability"`.
+
+The same classifier also supports [escalation](escalation_router_routing.md)
+and [custom routing](#custom-multi-target-routing) across two or more targets.
 
 ## Configure a classifier route
 
 This example uses the packaged classifier prompt as intended: it estimates
 whether the weak target can complete the task, and keeps the first routing
 decision for later requests in the same conversation.
+
+> Requires unreleased features. [Build from source](../getting_started.md#build-from-source) to run this example.
 
 ```toml
 schema_version = 1
@@ -225,8 +231,10 @@ The deterministic policy applies `base_threshold` and `threshold_step` after
 generation.
 
 Without affinity, the runtime judges every request. By default, it sends the
-opening task and the latest user follow-up when they differ. Set
-`recent_turn_window` when intervening conversation context affects the forecast.
+opening task and the latest user follow-up when they differ, excluding tool calls,
+tool results, and reasoning. It keeps ordinary user content from messages that
+also contain tool results. Set `recent_turn_window` when intervening conversation
+context affects the forecast.
 If a client sends only a follow-up fragment without the opening task, enable
 affinity or include the task history. Threshold tuning changes routing policy;
 it cannot recover missing task context.
