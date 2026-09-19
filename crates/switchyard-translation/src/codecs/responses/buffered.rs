@@ -844,6 +844,17 @@ fn flush_responses_tool_block(
 
 // Decodes a Responses reasoning item into private reasoning IR content.
 fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBlock> {
+    if let Some((text, signature)) = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .and_then(super::decode_anthropic_thinking)
+    {
+        return vec![ContentBlock::Reasoning {
+            text,
+            signature: Some(signature),
+            details: Vec::new(),
+        }];
+    }
     let mut parts = Vec::new();
     collect_responses_reasoning_text(item.get("content"), &mut parts);
     collect_responses_reasoning_text(item.get("summary"), &mut parts);
@@ -1140,6 +1151,11 @@ fn decode_responses_tool_choice(value: &Value) -> Option<ToolChoice> {
                 }
             })
         }
+        Value::Object(object)
+            if object.get("type").and_then(Value::as_str) == Some("allowed_tools") =>
+        {
+            Some(ToolChoice::Raw(value.clone()))
+        }
         Value::Object(_) => None,
         _ => Some(ToolChoice::Raw(value.clone())),
     }
@@ -1282,6 +1298,7 @@ fn encode_responses_input(
                 ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
             )
         }) {
+            let mut visible_content = Vec::new();
             for block in &content {
                 if let Some(item) = encode_responses_special_input(
                     block,
@@ -1292,8 +1309,28 @@ fn encode_responses_input(
                     diagnostics,
                     policy,
                 )? {
+                    if !visible_content.is_empty() {
+                        let content =
+                            encode_responses_content(&visible_content, diagnostics, policy)?;
+                        encoded.push(json!({
+                            "type": "message",
+                            "role": role_to_responses(message.role),
+                            "content": content,
+                        }));
+                        visible_content.clear();
+                    }
                     encoded.push(item);
+                } else if !matches!(block, ContentBlock::Reasoning { .. }) {
+                    visible_content.push(block.clone());
                 }
+            }
+            if !visible_content.is_empty() {
+                let content = encode_responses_content(&visible_content, diagnostics, policy)?;
+                encoded.push(json!({
+                    "type": "message",
+                    "role": role_to_responses(message.role),
+                    "content": content,
+                }));
             }
             continue;
         }
@@ -1360,6 +1397,7 @@ fn pair_tool_calls_with_outputs(items: &mut Vec<Value>) {
         let output = items
             .iter()
             .skip(index + 1)
+            .take_while(|item| item.get("type").and_then(Value::as_str) != Some("message"))
             .position(|item| call_id(item, output_kind).as_deref() == Some(&id))
             .map(|offset| index + 1 + offset);
         if let Some(output) = output
@@ -1767,6 +1805,15 @@ fn decode_responses_output_item(
             content: decode_responses_reasoning_item(item),
             stop_reason: None,
         })),
+        Some(kind) if super::is_native_output(kind) => Ok(Some(ResponseOutput {
+            url_citations: Vec::new(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::Unknown {
+                provider: WireFormat::OpenAiResponses.into(),
+                raw: Value::Object(item.clone()),
+            }],
+            stop_reason: None,
+        })),
         _ => Ok(None),
     }
 }
@@ -1810,10 +1857,12 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
         outputs
             .iter()
             .flat_map(|output| {
-                let has_tool_calls = output
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+                let has_output_items = output.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolCall(_))
+                        || matches!(block, ContentBlock::Unknown { provider, raw }
+                            if provider.as_str() == WireFormat::OpenAiResponses.as_str()
+                                && raw["type"].as_str().is_some_and(super::is_native_output))
+                });
                 let text = text_from_blocks(&output.content, "");
                 let reasoning = reasoning_text_from_blocks(&output.content, "\n");
                 let status = if matches!(output.stop_reason, Some(StopReason::MaxTokens)) {
@@ -1831,7 +1880,37 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                     ContentBlock::Reasoning { details, .. } => encrypted_reasoning_item_id(details),
                     _ => None,
                 });
-                if !reasoning.is_empty() || encrypted_reasoning.is_some() {
+                let has_signed_reasoning = output.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Reasoning {
+                            signature: Some(_),
+                            ..
+                        }
+                    )
+                });
+                if has_signed_reasoning {
+                    for (index, block) in output.content.iter().enumerate() {
+                        if let ContentBlock::Reasoning {
+                            text,
+                            signature,
+                            details,
+                        } = block
+                        {
+                            let encrypted = signature
+                                .as_deref()
+                                .map(|signature| super::encode_anthropic_thinking(text, signature))
+                                .or_else(|| encrypted_reasoning_data(details));
+                            let id = encrypted_reasoning_item_id(details)
+                                .unwrap_or_else(|| format!("rs_switchyard_{index}"));
+                            items.push(encode_responses_reasoning_output(
+                                text,
+                                encrypted.as_deref(),
+                                Some(&id),
+                            ));
+                        }
+                    }
+                } else if !reasoning.is_empty() || encrypted_reasoning.is_some() {
                     items.push(encode_responses_reasoning_output(
                         &reasoning,
                         encrypted_reasoning.as_deref(),
@@ -1839,7 +1918,7 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                     ));
                 }
 
-                if !text.is_empty() || (!has_tool_calls && reasoning.is_empty()) {
+                if !text.is_empty() || (!has_output_items && reasoning.is_empty()) {
                     items.push(json!({
                         "type": "message",
                         "id": "msg_switchyard",
@@ -1866,6 +1945,12 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                         "name": call.name,
                         "arguments": json_string_python_style(&call.arguments),
                     })),
+                    ContentBlock::Unknown { provider, raw }
+                        if provider.as_str() == WireFormat::OpenAiResponses.as_str()
+                            && raw["type"].as_str().is_some_and(super::is_native_output) =>
+                    {
+                        Some(raw.clone())
+                    }
                     _ => None,
                 }));
 

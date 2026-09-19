@@ -79,7 +79,10 @@ upstream, and a route's `id` is the model clients send to select that algorithm.
 Each target references an entry under `llm_clients`. All configured clients use
 `TranslatingLlmClient`; supported formats are `openai_chat`, `openai_responses`, and
 `anthropic_messages`. Supported algorithms are `noop`, `random`, `passthrough`,
-`llm_classifier`, and `stage_router`. The optional `prefill-router` feature also enables
+`llm_classifier`, `stage_router`, [`auto`](../../docs/reference/toml_schema.md#auto),
+[`composite`](../../docs/routing_algorithms/composite_routing.md), and
+[`advisor`](../../docs/routing_algorithms/advisor_gate_routing.md).
+The optional `prefill-router` feature also enables
 the experimental `prefill_router`. See its
 [artifact requirements](../../docs/reference/toml_schema.md#prefill_router).
 An `api_key_env` value names an environment variable. The TOML never contains the
@@ -151,6 +154,17 @@ Codex keeps its own model catalog and instructions. Select a Switchyard route ex
 with `codex --model route-id`; route aliases do not appear automatically in Codex's model
 picker. Unknown aliases use Codex's generic defaults and do not receive Switchyard's
 route-specific context limits or tool settings.
+
+For registered routes, the server returns HTTP 400 before dispatch when a request
+contains inputs disabled by `vision = false`, `reasoning = false`, or
+`tool_calling = false`. OpenAI errors use the `unsupported_capability` code;
+Anthropic errors use `invalid_request_error`. Remove the unsupported input or select
+a compatible route. Explicit `true` and unset declarations do not restrict requests.
+
+Codex keeps its own model settings, so it may still send inputs that the server rejects.
+The server preserves caller instructions and does not remove images, reasoning controls,
+or tools to make a request fit. These checks apply to registered server routes;
+transparent forwarding through `fallback_client` and direct library calls remain unchanged.
 
 To add instructions for a target, set `system_prompt` on its `[targets.<name>]` entry.
 Switchyard prepends that text when the selected target serves a completion and retains
