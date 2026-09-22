@@ -311,6 +311,9 @@ DeepSWE uses Harbor's task format but its own runner, [Pier](https://github.com/
 (required since v1.1 for the separate-verifier/collect-hook pattern). It is not part of
 `run-baseline.sh`.
 
+See [DeepSWE v1.1 qualification settings](DEEPSWE_V11_QUALIFICATION.md) for the exact
+versions, timeouts, scoring rules, and routing profiles used for qualification.
+
 ```bash
 git clone https://github.com/datacurve-ai/deep-swe benchmark/datasets/deep-swe
 uv tool install 'datacurve-pier>0.3.0'
@@ -349,6 +352,42 @@ pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
 `host.docker.internal` requires Docker Desktop; on Linux, pass the host's Docker-bridge address
 instead. Binding port 443 needs elevated privileges on most Linux hosts (`sudo`, or
 `setcap 'cap_net_bind_service=+ep'` on the binary).
+
+Advisor-gate routing (GPT-5.6 Luna executes; GPT-5.6 Sol reviews its "done" claims, up to
+three per task) measured 57.5% +/- 3.2 on the full 113 tasks (k=3, closed-book). The profile
+keeps the routing parameters exactly as run and reaches both models through OpenRouter, so it
+needs only `OPENROUTER_API_KEY`. The measured runs had Codex at reasoning effort `max`
+(`model_reasoning_effort = "max"` in the agent's Codex config); the profile forces `max` on
+both models server-side regardless:
+
+```bash
+export OPENROUTER_API_KEY="..."
+switchyard-server --config benchmark/routing-profiles/deepswe-v11-advisor-gate-luna-sol.toml \
+  --host 0.0.0.0 --port 443
+
+pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
+  --model openai/switchyard \
+  --ae OPENAI_BASE_URL=http://host.docker.internal:443/v1 \
+  --ae OPENAI_API_KEY=unused
+```
+
+The qualified stage-router profile (GPT-5.6 Luna efficient tier, GPT-5.6 Sol capable tier) solved
+76/113 tasks (67.3% strict) on the full closed-book benchmark. Its routing policy is published
+with OpenRouter provider settings so the file runs as-is with `OPENROUTER_API_KEY`. The header
+records the Switchyard commit, model ids, harness inputs, run id, and the one crashed task. The
+profile's public route id is `gpt-5.6-luna`, matching the qualification run:
+
+```bash
+export OPENROUTER_API_KEY="..."
+switchyard-server \
+  --config benchmark/routing-profiles/deepswe-v11-stage-router-luna-sol.toml \
+  --host 0.0.0.0 --port 443
+
+pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
+  --model openai/gpt-5.6-luna \
+  --ae OPENAI_BASE_URL=http://host.docker.internal:443/v1 \
+  --ae OPENAI_API_KEY=unused
+```
 
 Smoke subset:
 
