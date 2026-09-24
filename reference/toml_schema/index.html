@@ -592,6 +592,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../integrations/pi/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    pi
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../integrations/oh_my_pi/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Oh My Pi
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1866,7 +1922,7 @@ Token-count requests do not apply target system prompts.</p>
 <td><code>context_window</code></td>
 <td style="text-align: center;">No</td>
 <td>unset</td>
-<td>Positive token count advertised for this route by <code>GET /v1/models</code>. Unset values appear as <code>null</code>. This does not enforce a request limit.</td>
+<td>Positive token count that <code>GET /v1/models</code> advertises for this route as <code>data[].context_length</code>. Unset values appear as <code>null</code>. This does not enforce a request limit.</td>
 </tr>
 <tr>
 <td><code>tool_calling</code></td>
@@ -2154,7 +2210,7 @@ dependencies available in the active virtual environment.</p>
 <td><code>message_hash_fallback</code></td>
 <td style="text-align: center;">No</td>
 <td><code>false</code></td>
-<td>Keys affinity on the first user message. Requires <code>classify_trigger = "new_session"</code>.</td>
+<td>Retains the target against a hash of the first user message when a request carries no session ID. Requires <code>classify_trigger = "new_session"</code> or <code>"user_turn"</code>.</td>
 </tr>
 <tr>
 <td><code>recent_turn_window</code></td>
@@ -2304,7 +2360,7 @@ how one route chooses between more than two models.</p>
 <td><code>message_hash_fallback</code></td>
 <td style="text-align: center;">No</td>
 <td><code>false</code></td>
-<td>Keys affinity on the first user message. Requires <code>classify_trigger = "new_session"</code>.</td>
+<td>Retains the target against a hash of the first user message when a request carries no session ID. Requires <code>classify_trigger = "new_session"</code> or <code>"user_turn"</code>.</td>
 </tr>
 <tr>
 <td><code>recent_turn_window</code></td>
