@@ -772,7 +772,9 @@ async fn stateful_escalation_warns_once_without_a_session_id() -> switchyard_lib
     })?) as Arc<dyn Algorithm>;
     let client = Arc::new(JudgeClient {
         judge_model: "warning-judge".into(),
-        outcome: JudgeOutcome::Reply(r#"{"escalate":false,"reason":"progressing"}"#),
+        outcome: JudgeOutcome::Reply(
+            r#"{"escalate":false,"category":"none","new_evidence":false,"reason":"progressing"}"#,
+        ),
     }) as Arc<dyn RoutedLlmClient>;
 
     for _ in 0..2 {
@@ -828,7 +830,9 @@ async fn deescalation_evidence_stays_pending_until_confirmed() -> switchyard_lib
 
     switchyard_llm_client::run(
         router.clone(),
-        ClientRouter::single(client(r#"{"escalate":true,"reason":"stuck"}"#)),
+        ClientRouter::single(client(
+            r#"{"escalate":true,"category":"repetition","new_evidence":true,"reason":"stuck"}"#,
+        )),
         request.clone(),
         classifier_models("evidence-judge", "evidence-efficient", "evidence-capable"),
         None,
@@ -836,7 +840,9 @@ async fn deescalation_evidence_stays_pending_until_confirmed() -> switchyard_lib
     .await?;
     let outcome = switchyard_llm_client::decide(
         router,
-        ClientRouter::single(client(r#"{"escalate":false,"reason":"recovered"}"#)),
+        ClientRouter::single(client(
+            r#"{"escalate":false,"category":"none","new_evidence":false,"reason":"recovered"}"#,
+        )),
         request,
         classifier_models("evidence-judge", "evidence-efficient", "evidence-capable"),
     )
