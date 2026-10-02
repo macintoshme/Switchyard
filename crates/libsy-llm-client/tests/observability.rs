@@ -34,9 +34,10 @@ use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 use switchyard_libsy::{
-    Algorithm, ClassifierContractConfig, ClassifyTrigger, DeescalationConfig, Driver,
-    EscalationJudgeConfig, LibsyError, LlmClassifierConfig, LlmTaskClassifier, PickerMode,
-    RoutingOutcome, RuntimeModels, StageRouter, StageRouterConfig, Step, TaskClassifierConfig,
+    Algorithm, CapabilityJudgeConfig, ClassifierContractConfig, ClassifyTrigger,
+    DeescalationConfig, Driver, EscalationJudgeConfig, LibsyError, LlmCapabilityConfig,
+    LlmClassifierConfig, LlmTaskClassifier, PickerMode, RoutingOutcome, RuntimeModels, StageRouter,
+    StageRouterConfig, Step, TaskClassifierConfig,
 };
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{Category, ModelId};
@@ -606,7 +607,11 @@ fn classifier_router() -> switchyard_libsy::Result<Arc<dyn Algorithm>> {
     Ok(Arc::new(LlmTaskClassifier::new(
         LlmClassifierConfig::Capability {
             config: TaskClassifierConfig {
-                base_threshold: 0.5,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.5,
+                    ..LlmCapabilityConfig::default()
+                }),
+                fail_open: false,
                 ..TaskClassifierConfig::default()
             },
         },
@@ -868,7 +873,10 @@ async fn affinity_keeps_the_algorithm_selection_after_client_fallback()
     });
     let router = Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Capability {
         config: TaskClassifierConfig {
-            base_threshold: 0.5,
+            judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                base_threshold: 0.5,
+                ..LlmCapabilityConfig::default()
+            }),
             classify_trigger: ClassifyTrigger::NewSession,
             ..TaskClassifierConfig::default()
         },
@@ -1618,6 +1626,7 @@ async fn failed_call_records_metrics_without_error_details() -> switchyard_libsy
             Ok(Step::CallModel(call)) => {
                 call.respond(Err(test_error("synthetic upstream failure")))?;
             }
+            Ok(Step::CallDecision(_)) => return Err(test_error("unexpected decision call")),
             Ok(Step::Done(_)) => {
                 return Err(test_error("expected the failed call to fail the run"));
             }
@@ -1851,6 +1860,101 @@ async fn classifier_stops_on_client_errors_and_records_verdict_fallback()
                 "client failures and valid verdicts must not increment switchyard.classifier_fail_open"
             ),
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn classifier_can_fail_open_on_judge_client_errors() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    assert!(TaskClassifierConfig::default().fail_open);
+    for (judge, reason) in [
+        (
+            Arc::new(TimeoutClient) as Arc<dyn RoutedLlmClient>,
+            "timeout",
+        ),
+        (
+            Arc::new(JudgeClient {
+                judge_model: "judge".into(),
+                outcome: JudgeOutcome::CallFailure,
+            }),
+            "upstream_5xx",
+        ),
+        (
+            Arc::new(JudgeClient {
+                judge_model: "judge".into(),
+                outcome: JudgeOutcome::StreamDecodeFailure,
+            }),
+            "invalid_response",
+        ),
+    ] {
+        let algorithm = |fail_open: Option<bool>| -> switchyard_libsy::Result<Arc<dyn Algorithm>> {
+            let mut config = serde_json::json!({"base_threshold": 0.5});
+            if let Some(fail_open) = fail_open {
+                config["fail_open"] = fail_open.into();
+            }
+            Ok(Arc::new(LlmTaskClassifier::new(
+                LlmClassifierConfig::Capability {
+                    config: serde_json::from_value(config).unwrap(),
+                },
+            )?))
+        };
+        let clients = ClientRouter::new(std::collections::HashMap::from([
+            (ModelId::from("judge"), judge),
+            (
+                ModelId::from("capable"),
+                Arc::new(JudgeClient {
+                    judge_model: "judge".into(),
+                    outcome: JudgeOutcome::CallFailure,
+                }) as Arc<dyn RoutedLlmClient>,
+            ),
+        ]));
+        let models = classifier_models("judge", "efficient", "capable");
+        let stopped = switchyard_llm_client::decide(
+            algorithm(Some(false))?,
+            clients.clone(),
+            classifier_request(),
+            models.clone(),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Err(LibsyError::ClientCall { .. })),
+            "{reason}"
+        );
+
+        let outcome = switchyard_llm_client::decide(
+            algorithm(None)?,
+            clients.clone(),
+            classifier_request(),
+            models.clone(),
+        )
+        .await?;
+        assert_eq!(outcome.selected_model_id()?.as_str(), "capable");
+        assert_eq!(
+            outcome.metadata.and_then(|metadata| metadata.evidence),
+            Some(serde_json::json!({"source": "fail_open", "reason_code": reason})),
+        );
+        let (selected, _) = switchyard_llm_client::run(
+            algorithm(Some(true))?,
+            clients,
+            classifier_request(),
+            models.clone(),
+            None,
+        )
+        .await?;
+        assert_eq!(selected.as_str(), "capable");
+
+        let answer_failure = switchyard_llm_client::run(
+            algorithm(None)?,
+            ClientRouter::single(Arc::new(TimeoutClient)),
+            classifier_request(),
+            models,
+            None,
+        )
+        .await;
+        assert!(matches!(answer_failure, Err(LibsyError::ClientCall {
+            target, source: LlmClientError::Timeout { .. },
+        }) if target.as_str() == "capable"));
     }
     Ok(())
 }
